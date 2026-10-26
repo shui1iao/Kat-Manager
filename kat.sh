@@ -12,9 +12,9 @@
 # A download/verification failure changes nothing.
 set -Eeuo pipefail
 
-KAT_MANAGER_VERSION="0.1.0"
-KAT_HELPER_MANAGER_SHA256="e2316a817ebbb7785aca24136feea024e4609c8d60239a65b80db2a050d50711"
-KAT_HELPER_CONFIG_SHA256="da0f62bde133fbbc0e487ebf1adcc37d7aba1b17066c7723ba3df8ae62a7eb0b"
+KAT_MANAGER_VERSION="0.1.1"
+KAT_HELPER_MANAGER_SHA256="213f916eaae25e3274a493090a531817f59a6fc083605845d3bfc88fa8c860ad"
+KAT_HELPER_CONFIG_SHA256="1a59da7438364b120ab77070b6e84862bac5d23aa72aa2971a2fe264dc7bec0d"
 
 kat_src="${BASH_SOURCE[0]:-}"
 if [[ -n "$kat_src" && -f "$kat_src" ]]; then

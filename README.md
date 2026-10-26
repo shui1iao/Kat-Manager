@@ -1,5 +1,7 @@
 # Kat-Manager
 
+当前版本：**v0.1.1**。
+
 Kat 内核的统一管理脚本。一个入口 `kat.sh`，管理 Kat 支持的 4 种协议：
 
 | 协议 | 服务 | 配置 | 说明 |
@@ -63,12 +65,12 @@ curl -fsSL http://127.0.0.1:18080/kat.sh | KAT_MANAGER_BASE_URL=http://127.0.0.1
 
 ```
 ============================================
-          Kat 管理脚本 v0.1.0
+          Kat 管理脚本 v0.1.1
 ============================================
 仓库: github.com/shui1iao/Kat-Manager
 作者: shui1iao
 ============================================
-内核版本：0.6.2
+内核版本：0.7.0
 SS     ：运行中  端口 21177
 AnyTLS ：未安装
 Trojan ：未安装
@@ -96,7 +98,7 @@ SOCKS5 ：未安装
 
 「1. 安装协议」：选协议 → 端口（回车随机）→ SS 选加密方式 → SOCKS5 填用户名 → 密码（回车随机）→ Trojan 可填自备证书路径 → 安装并输出节点信息。该协议已经由本脚本安装时提示「已安装，可在管理协议里修改」，不会覆盖。
 
-「2. 管理协议」：选协议后进入子菜单：1 查看配置、2 修改配置（端口 / SOCKS5 用户名 / 密码，回车不变，密码输入 `r` 随机生成）、3 启动、4 停止、5 重启、6 查看状态、7 卸载（先确认，再询问是否删除配置文件，回车保留）、0 返回。
+「2. 管理协议」：选协议后进入子菜单：1 查看配置、2 修改配置（端口 / SOCKS5 用户名 / 密码，回车不变，密码输入 `r` 随机生成）、3 启动、4 停止、5 重启、6 查看状态、7 卸载（先确认，再询问是否删除配置文件，回车保留）、8 查看日志、0 返回。原 1–7 含义不变。
 
 「3. 更新内核」：输入目标版本，回车取 latest。
 
@@ -115,6 +117,7 @@ bash kat.sh help
 | `install <协议>` | 安装并启动，输出节点信息。端口冲突或该协议已安装时拒绝，零改动 |
 | `view <协议>`（`config`） | 输出节点信息（Surge / Mihomo / URI） |
 | `status <协议>` | `systemctl status` |
+| `logs <协议> [--lines N] [--follow]` | 受管单位 journal；默认最近100行、非实时、无分页；实时仅显式选择 |
 | `modify <协议>` | `--port` / `--listen` / `--credential-file`；SS 可加 `--method`（换方式时必须同时给新凭据）；SOCKS5 可加 `--username`。运行中的服务会重启；停止的服务保持停止 |
 | `start` / `stop` / `restart <协议>` | 启停 |
 | `uninstall <协议> [--purge]` | 停止并禁用。交互时询问是否删除配置/证书/单元（默认保留）；`--purge` 不问直接删；非交互且没给 `--purge` 时保留 |
@@ -146,6 +149,33 @@ bash kat.sh modify trojan --port 8443
 bash kat.sh uninstall socks5 --purge
 bash kat.sh update --version 0.6.2
 ```
+
+## 查看日志与手改 0.7 配置
+
+本脚本保持基础生命周期，不提供规则/配置编辑器、统计/连接/策略组代理或 TLS/ACME 向导。首页仍为 1 安装、2 管理、3 更新；管理子菜单仅增加 **8 查看日志**。
+
+```bash
+bash kat.sh logs ss                 # 最近100行，非实时，--no-pager
+bash kat.sh logs anytls --lines 50
+bash kat.sh ss logs --follow        # 显式实时跟随，Ctrl-C 停止查看
+```
+
+菜单 8 回车看最近100行，输入 `f` 才跟随。日志仍可用于受管服务已停止/failed、配置 JSON 无效时排障，不要求配置检查成功或管理 socket 可达；foreign、drop-in、伪 marker、受管路径 symlink/hash 冲突仍拒绝。只查询所选固定 `kat-<协议>.service`，不读取其他服务日志。
+
+**日志可能包含目标、来源、动态名称等私密信息，分享前自行检查；不承诺脱敏。** 这里只查看 systemd journal。用户若自行配置 `log.file`，文件日志须按自己的路径查看，不由脚本扫描或接管。
+
+Kat ≥ 0.7 时，用户可自行编辑 JSON 的高级区；基础 view/status/start/update/modify 会核对单入站/协议/单身份/监听/凭据和真实 `kat check`，复杂 schema、规则/组/provider 跨引用由内核校验。不复制另一套 0.7 规则解析器，不自动改 API 或其他配置区。旧内核继续使用原严格读取边界。
+
+`modify` 仍只改所选端口/凭据等基本字段，保留未选高级区的 JSON 值、凭据和证书引用（格式化空白可能变化）。**运行服务按原版重启；停止服务只保存不启动**，不新增自动 reload 事务。若自己手改后需要热重载，直接用原生内核命令：
+
+```bash
+kat check /etc/kat/ss.json
+kat reload -c /etc/kat/ss.json
+```
+
+原安装的随机、自签、legacy-insecure、supplied 默认和 marker 不变。手改复杂 TLS（多证书/文件跟随/ACME 等）后，若旧 marker 不能可靠表达客户端验证/SNI，查看节点会提示「该TLS配置需自行按配置设置客户端」，不生成猜测的 Surge/Mihomo/URI、不推定已签发、不自动降为 insecure。start/update 仍以有效内核配置为准，不因旧单文件展示假设拒绝。配置、单位、内核所有权/hash 校验没有放宽，也不写新 TLS marker。
+
+本版本未修改 Kat 内核，也未验证真实 ACME/DNS 写入或签发；内核的 6h 未覆盖、AnyTLS 已建 carrier 可继续新开逻辑流、api/stats.file 重载非原子三项已知限制原样保留。内核二进制 update、失败恢复及旧 migrate/adopt/rollback 命令退役决定均不变。
 
 ## 节点输出
 
@@ -231,8 +261,8 @@ socks5://katuser1:ExampleSocksPw123456@203.0.113.10:41080#VPS
     - SNI 取 `--sni`；没给就取证书 SAN 里的第一个 DNS 名（非通配），没有 SAN 时取 CN。
     - SNI 必须被证书覆盖，否则拒绝。
   - `--cert` 本身就是自签证书时，按自签模式处理（客户端跳过校验，不接受 `--sni`）。
-- 标记规则和 AnyTLS 一样严格：TLS/SNI 标记缺失、重复、取值未知，或者与配置/证书实际情况不符，都按损坏处理。首页显示「异常」，所有操作拒绝执行。
-- 不支持在 modify 里更换证书。要换证书，请先 `uninstall --purge`，再重新 install。
+- 标记结构保持严格：TLS/SNI 标记缺失、重复、取值未知均拒绝。旧内核仍严格核对来源；0.7 手改有效复杂 TLS 时，只放弃无法可靠推定的客户端输出，不改 marker，也不弱化单位/hash/路径所有权。
+- `modify` 不更换证书。基础安装仍使用上面的证书选项；0.7 高级 TLS 由用户自己改 JSON、check/reload 并设置客户端。
 
 AnyTLS 保持 AnyTLS-Manager 的行为：默认用随机证书（配置里不写 `tls`，标记 `random-insecure`）；自备证书需要 `--cert --key --tls-policy legacy-insecure --ack-certificate-change`（标记 `legacy-insecure`）。
 
@@ -288,16 +318,22 @@ AnyTLS 保持 AnyTLS-Manager 的行为：默认用随机证书（配置里不写
 
 环境变量（测试或自建镜像用）：`KAT_MANAGER_BASE_URL`（helper 下载地址）、`KAT_RELEASE_BASE_URL`（Release 下载前缀，下面是 `v<版本>/kat-<版本>-linux-amd64[.sha256]`）、`KAT_RELEASE_LATEST_URL`（返回 `{"tag_name":"vX.Y.Z"}` 的地址）、`KAT_PUBLIC_IP_URL`、`KAT_MANAGER_SETTLE_SECONDS`（启动后等待判定 active 的秒数）。
 
-## 开发
+## 版本与验证
+
+本次精简改动已通过基础格式/配置/生命周期兼容回归 **42 项**、日志入口与手改 0.7 配置的定向回归 **7 项**，使用隔离目录、systemctl/journalctl 测试替身及真实内核的 check/version；没有操作运行中的服务或读取真实 journal。最终版本只追加版本/header、Bash/Python 语法、helper pin，以及独立 curl wrapper 和 hash 篡改拒绝短验证，不重复长测。
+
+测试不等于真实 journal/实时流、ACME/DNS 签发续期、第三方客户端全矩阵或长期运行验证。下面的客户端格式说明沿用原版本验证结论，本次未重新跑完整互通矩阵。
+
+维护者修改 helper 后必须同步更新 wrapper 的 SHA256：
 
 ```bash
-bash scripts/pin-helpers.sh            # 修改 helper 后更新 kat.sh 里内置的 SHA256（只改这两行，不发布）
-bash scripts/pin-helpers.sh --check    # 只校验
+bash scripts/pin-helpers.sh
+bash scripts/pin-helpers.sh --check
 ```
 
 ## 已知限制
 
-- 只支持 linux-amd64、systemd、root。不做 VLESS、Snell、ACME、证书模式切换、自动定时更新。
+- 只支持 linux-amd64、systemd、root。不做 VLESS、Snell、ACME 配置/证书模式向导、自动定时更新；有效 0.7 手改配置只作最低兼容。
 - 每个协议只管一个节点、一个用户。不提供迁移旧服务、接管手工安装、内核回滚：手写的 `kat-<协议>` 显示为「已存在（非本脚本安装）」，需要人工处理（例如停掉并删除后再用本脚本安装）。
 - 换内核版本只能用 `update --version X.Y.Z` 重新下载，不保留旧二进制。
 - `--credential-file` 取文件的精确内容，末尾有换行会被拒绝（控制字符不合法）。

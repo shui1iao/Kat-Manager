@@ -36,7 +36,7 @@ import urllib.request
 from kat_config import (ERROR, KINDS, MAX_BYTES, METHODS, PROTOCOL, SAFE_PATH, credential, domain_name, listen,
                         loads, markers, node, reject, text, tls_matches, unit, unit_sni, unit_tls_policy)
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 BIN = '/usr/local/bin/kat'
 # Left behind by the previous Kat-mode release; removed after the next successful update.
 OLD_ROLLBACK = '/usr/local/bin/kat.rollback'
@@ -60,7 +60,7 @@ VERSION_RE = re.compile(r'[0-9]+\.[0-9]+\.[0-9]+')
 MAX_DOWNLOAD = 256 << 20
 ALNUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 SOCKS5_WARNING = '⚠ 注意：SOCKS5 不加密，流量（包括用户名和密码）在网络上是明文传输！'
-PROTOCOL_ACTIONS = ('install', 'view', 'config', 'status', 'modify', 'start', 'stop', 'restart', 'uninstall')
+PROTOCOL_ACTIONS = ('logs', 'install', 'view', 'config', 'status', 'modify', 'start', 'stop', 'restart', 'uninstall')
 GLOBAL_ACTIONS = ('update', 'help', 'menu', 'status')
 MUTATING = ('install', 'modify', 'start', 'stop', 'restart', 'update', 'uninstall')
 EDIT_FLAGS = ('address', 'port', 'method', 'credential_file', 'username', 'cert', 'key', 'sni',
@@ -83,6 +83,7 @@ USAGE = '''Kat-Manager %s —— Kat 内核统一管理脚本（SS / AnyTLS / Tr
   status            systemd 状态（不带协议时显示总览）
   modify            修改 --port/--listen/--credential-file（SS 可加 --method；SOCKS5 可加 --username）
   start|stop|restart
+  logs              查看受管单位 journal（默认最近100行、无分页；--lines N；--follow 才实时）
   uninstall [--purge]  停止并禁用；交互询问是否删除配置/证书/单元（默认保留）
 全局动作：
   update [--version X.Y.Z | --binary FILE --sha256 HEX]   更新共享内核（覆盖所有 Kat 服务，失败自动退回）
@@ -381,6 +382,7 @@ class Manager:
         self.staging = root != Path('/')
         # Test seams are honoured only for an isolated staging root.
         self.stub = os.environ.get('KAT_MANAGER_TEST_SYSTEMCTL') if self.staging else None
+        self.journal_stub = os.environ.get('KAT_MANAGER_TEST_JOURNALCTL') if self.staging else None
         self.settle = float(os.environ.get('KAT_MANAGER_SETTLE_SECONDS', '3'))
         self.keep = []
 
@@ -768,28 +770,54 @@ class Manager:
             reject()
         return policy, sni
 
-    def load(self, kind):
-        """A complete managed installation, or None when absent. Partial/broken fails."""
+    def managed_unit(self, kind):
+        """Ownership without parsing configuration: logs must work even when
+        JSON is broken. Fixed ExecStart/config path, markers, hash and drop-in
+        checks are still mandatory; no other unit's journal may be selected."""
         traces = self.kat_traces(kind)
         if not traces:
             return None
         self.refuse_foreign(kind)
         if any(p.endswith('.d') for p in traces):
-            fail('kat-' + kind + '.service 有 drop-in（' + ', '.join(p for p in traces if p.endswith('.d')) +
-                 '），实际启动参数无法确定；已拒绝操作')
-        config, service = self.config(kind), self.service(kind)
-        raw_unit = read(service)
+            fail('kat-' + kind + '.service 有 drop-in，实际启动参数无法确定；已拒绝操作')
+        self.config(kind)  # reject redirected/symlink config paths, even for logs
+        raw_unit = read(self.service(kind))
         binary, digest = unit(kind, raw_unit)
-        data = loads(read(config))
-        current = node(kind, data)
-        tls_matches(kind, raw_unit, current)
-        policy, sni = self.trojan_tls(kind, raw_unit, current)
         if binary != BIN:
             fail('kat-' + kind + '.service 的 ExecStart 使用 ' + binary + '，不是 ' + BIN + '；本脚本只管理 ' + BIN)
         path = self.owned(BIN)
         if not path.is_file() or file_hash(path) != digest:
             reject()
-        current = dict(current, policy=policy, sni=sni)
+        return raw_unit, digest
+
+    def modern(self, binary=None):
+        return (version_tuple(kat_version(binary or self.owned(BIN))) or (0,)) >= (0, 7, 0)
+
+    def load(self, kind):
+        """A complete managed installation, or None when absent."""
+        owned = self.managed_unit(kind)
+        if owned is None:
+            return None
+        raw_unit, digest = owned
+        data = loads(read(self.config(kind)))
+        modern = self.modern()
+        current = node(kind, data, modern=modern)
+        if modern:
+            self.check(self.owned(BIN), data)
+        tls = current.get('tls')
+        manual_tls = modern and kind in CERT_DIR and tls is not None and set(tls) != {'cert', 'key'}
+        policy, sni = None, None
+        if not manual_tls:
+            try:
+                tls_matches(kind, raw_unit, current)
+                policy, sni = self.trojan_tls(kind, raw_unit, current)
+            except ValueError:
+                if not modern:
+                    raise
+                # A valid hand-edited TLS source may no longer match the old
+                # display policy. Do not rewrite markers or invent client links.
+                manual_tls = True
+        current = dict(current, policy=policy, sni=sni, tls_manual=manual_tls)
         return {'kind': kind, 'raw_unit': raw_unit, 'data': data, 'current': current, 'digest': digest}
 
     def installs(self):
@@ -809,7 +837,7 @@ class Manager:
         folder = self.owned('/etc/kat')
         if not trace(folder):
             folder = self.scratch()
-        check(str(binary), data, self.root, folder, source_tls=source_tls)
+        check(str(binary), data, self.root, folder, source_tls=source_tls, modern=self.modern(binary))
 
     def unit_text(self, kind, digest, policy=None, sni=None):
         marks = '# KatManagerSHA256=' + digest + '\n'
@@ -946,6 +974,27 @@ class Manager:
         display(self.kind, self.host(), item['current'])
 
     do_config = do_view
+
+    def do_logs(self):
+        self.no_edit_flags()
+        self.no_kernel_flags()
+        if self.managed_unit(self.kind) is None:
+            fail('未安装 Kat ' + LABEL[self.kind] + '；没有可定位的受管单位')
+        args = ['--unit', 'kat-' + self.kind + '.service', '--lines', str(self.a.lines or 100), '--no-pager']
+        if self.a.follow:
+            args.append('--follow')
+        if self.a.offline:
+            print('OFFLINE ' + shlex.join(['journalctl', *args]), flush=True)
+            if not self.journal_stub:
+                return  # never read the host journal during staging/offline tests
+        try:
+            result = subprocess.run(([self.journal_stub] if self.journal_stub else ['journalctl']) + args,
+                                    timeout=None if self.a.follow else 30)
+        except KeyboardInterrupt:
+            info('已停止查看日志')
+            return
+        if result.returncode:
+            fail('journalctl 查看受管单位日志失败；未修改配置或服务')
 
     def do_status(self):
         self.no_edit_flags()
@@ -1193,7 +1242,8 @@ class Manager:
                 inbound['users'][0]['username'] = a.username
             self.socks5_user(inbound['users'][0]['username'], inbound['users'][0]['password'])
         try:
-            final = dict(node(kind, data), policy=current.get('policy'), sni=current.get('sni'))
+            final = dict(node(kind, data, modern=self.modern()), policy=current.get('policy'),
+                         sni=current.get('sni'), tls_manual=current.get('tls_manual', False))
         except ValueError:
             fail('新的监听或凭据不合法；未做任何改动')
         encoded = self.encode(data)
@@ -1558,30 +1608,51 @@ class Manager:
         print(paint('CYAN', BAR), flush=True)
 
 
-def check(binary, data, root, directory, source_tls=False):
+def check(binary, data, root, directory, source_tls=False, modern=False):
     temporary_data = copy.deepcopy(data)
-    tls = temporary_data['inbounds'][0].get('tls')
-    if tls and not source_tls:
-        tls.update({key: str(root / value.lstrip('/')) for key, value in tls.items()})
-        certificate(Path(tls['cert']), Path(tls['key']))
-        if Path(tls['key']).stat().st_mode & 0o077 or Path(tls['key']).parent.stat().st_mode & 0o077:
-            reject()
-    # Routing-core file references: absolute paths are rebased by plain prefix
-    # (exact identity when root is '/') so an offline staging check never reads
-    # host files; relative paths resolve against the check's working directory,
-    # which is the root like a systemd service's default '/'. Only the temporary
-    # check copy changes; the stored config is untouched.
-    prefix = str(root).rstrip('/')
 
-    def rebase(path):
-        return prefix + path if path.startswith('/') else path
+    def rebase(value):
+        if not isinstance(value, str) or not value or any(ord(c) < 32 or ord(c) == 127 for c in value) or '..' in Path(value).parts:
+            reject()
+        path = root / value.lstrip('/')
+        if not path.resolve().is_relative_to(root):
+            reject()
+        return str(path)
+
+    def fields(block, keys):
+        if not isinstance(block, dict):
+            return  # let kat check reject invalid advanced block types
+        for key in keys:
+            if block.get(key):
+                block[key] = rebase(block[key])
+
+    tls = temporary_data['inbounds'][0].get('tls')
+    if tls:
+        pairs = ([tls] if tls.get('cert') or tls.get('key') else []) + tls.get('certificates', [])
+        for pair in pairs:
+            if not source_tls:
+                fields(pair, ('cert', 'key'))
+            if not modern:
+                certificate(Path(pair['cert']), Path(pair['key']))
+            # The kernel validates modern file-following/multi-cert/ACME TLS.
+            # Keep private-key permissions and staging containment constraints.
+            key = Path(pair['key']).resolve()
+            if key.stat().st_mode & 0o077 or key.parent.stat().st_mode & 0o077:
+                reject()
+        acme = tls.get('acme')
+        if isinstance(acme, dict):
+            fields(acme, ('storage', 'webroot', 'directory_ca'))
+            fields(acme.get('dns'), ('api_token_file',))
     for outbound in temporary_data.get('outbounds', []):
-        if 'ca' in outbound.get('tls', {}):
-            outbound['tls']['ca'] = rebase(outbound['tls']['ca'])
-    for source in [*temporary_data.get('rule_sets', []), *filter(None, [temporary_data.get('geoip')])]:
-        source['path'] = rebase(source['path'])
-    # A check never binds a listener. All diagnostics are deliberately discarded.
-    # The copy uses the stored encoding so the core's size limit applies alike.
+        if isinstance(outbound, dict):
+            fields(outbound.get('tls'), ('ca',))
+    for source in [*temporary_data.get('rule_sets', []), *temporary_data.get('providers', []),
+                   *[temporary_data[k] for k in ('geoip', 'geosite', 'asn') if k in temporary_data]]:
+        fields(source, ('path',))
+    for block, keys in (('log', ('file',)), ('stats', ('file',)), ('api', ('socket',))):
+        fields(temporary_data.get(block), keys)
+    # The stored data is never changed. check does not bind listeners, fetch
+    # subscriptions or issue certificates; discard potentially private errors.
     with tempfile.NamedTemporaryFile(mode='w', prefix='.kat-check-', dir=directory, encoding='utf-8') as f:
         f.write(json.dumps(temporary_data, ensure_ascii=False, indent=2) + '\n')
         f.flush()
@@ -1626,6 +1697,10 @@ def display(kind, host, value):
     if kind == 'socks5':
         field('用户名', value['username'])
     field('密码', password)
+    if kind in CERT_DIR and value.get('tls_manual'):
+        warn('该TLS配置需自行按配置设置客户端；不生成 Surge/Mihomo/URI，不能据配置确认 ACME 已签发或推定验证策略')
+        print(rule, flush=True)
+        return
     if kind == 'ss':
         method = value['method']
         auth = method + ':' + quote(password, safe='') if method.startswith('2022-') else base64.urlsafe_b64encode((method + ':' + password).encode()).decode().rstrip('=')
@@ -1790,7 +1865,7 @@ class Menu:
             err('Kat ' + LABEL[kind] + ' 已存在（非本脚本安装）：' + detail + '；本脚本不管理它')
             return self.pause()
         actions = [('查看配置', 'view'), ('修改配置', 'modify'), ('启动', 'start'), ('停止', 'stop'), ('重启', 'restart'),
-                   ('查看状态', 'status'), ('卸载', 'uninstall')]
+                   ('查看状态', 'status'), ('卸载', 'uninstall'), ('查看日志', 'logs')]
         while True:
             clear_screen()
             self.heading('管理 ' + LABEL[kind])
@@ -1811,6 +1886,12 @@ class Menu:
                 action = actions[int(choice) - 1][1]
                 if action == 'modify':
                     self.modify(kind)
+                elif action == 'logs':
+                    answer = ask('日志：回车最近100行，f实时跟随，0取消: ')
+                    if answer == '' or answer in ('f', 'F'):
+                        self.execute('logs', kind, follow=bool(answer))
+                    else:
+                        info('已取消')
                 elif action == 'uninstall':
                     if (ask('确认卸载 Kat ' + LABEL[kind] + '（停止并禁用 kat-' + kind + '.service）？[y/N]: ') or '').lower() in ('y', 'yes'):
                         self.execute('uninstall', kind)
@@ -1856,6 +1937,12 @@ def port_number(value):
     return int(value)
 
 
+def log_lines(value):
+    if not value.isascii() or not value.isdigit() or int(value) < 1:
+        raise argparse.ArgumentTypeError('--lines 应为正整数')
+    return int(value)
+
+
 def parser():
     p = argparse.ArgumentParser(prog='bash kat.sh', add_help=False, usage='bash kat.sh [动作] [协议] [参数]（bash kat.sh help）')
     p.add_argument('words', nargs='*')
@@ -1875,6 +1962,8 @@ def parser():
     p.add_argument('--ack-certificate-change', action='store_true')
     p.add_argument('--host')
     p.add_argument('--purge', action='store_true')
+    p.add_argument('--lines', type=log_lines)
+    p.add_argument('--follow', action='store_true')
     p.add_argument('--root', type=Path, default=Path('/'))
     p.add_argument('--offline', action='store_true')
     return p
@@ -1902,6 +1991,8 @@ def arguments(argv):
         fail(action + ' 需要指定协议：ss / anytls / trojan / socks5')
     if action not in PROTOCOL_ACTIONS and action not in GLOBAL_ACTIONS:
         fail('未知动作：' + action + '（见 bash kat.sh help）')
+    if action != 'logs' and (a.lines is not None or a.follow):
+        fail('--lines/--follow 仅用于 logs')
     a.action, a.kind = action, kind
     return a
 

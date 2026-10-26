@@ -841,7 +841,25 @@ def single_user(users, required):
     return users[0]
 
 
-def node(kind, data):
+def node(kind, data, modern=False):
+    if modern:
+        # Own only the single inbound/identity in 0.7. The caller must run the
+        # real kernel check for all advanced schema and cross references.
+        if not isinstance(data, dict) or not isinstance(data.get('inbounds'), list) or len(data['inbounds']) != 1:
+            reject()
+        inbound = data['inbounds'][0]
+        if not isinstance(inbound, dict):
+            reject()
+        basic = {k: v for k, v in inbound.items() if k in ('protocol', 'listen', 'ss', 'anytls', 'users')}
+        if 'tls' in inbound:
+            if not isinstance(inbound['tls'], dict):
+                reject()
+            # Keep the legacy identity reader, not its single-file TLS schema.
+            basic['tls'] = {'cert': '/certificate.pem', 'key': '/private.pem'}
+        result = node(kind, {'inbounds': [basic]})
+        if kind in ('anytls', 'trojan'):
+            result['tls'] = inbound.get('tls')
+        return result
     if kind not in KINDS:
         reject()
     shape(data, ('inbounds',), ('limits', 'dns', 'routing') + CORE_BLOCKS)
