@@ -38,7 +38,7 @@ import urllib.request
 from kat_config import (ERROR, KINDS, MAX_BYTES, METHODS, PROTOCOL, SAFE_PATH, credential, domain_name, listen,
                         loads, markers, node, reject, text, tls_matches, unit, unit_sni, unit_tls_policy)
 
-VERSION = '0.1.2'
+VERSION = '0.1.3'
 BIN = '/usr/local/bin/kat'
 # No trustworthy digest exists for an arbitrary legacy rollback file; leave it alone.
 OLD_ROLLBACK = '/usr/local/bin/kat.rollback'
@@ -188,6 +188,21 @@ def read_secret(path):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as f:
         checked_file(os.fstat(f.fileno()), private=True)
+        data = f.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        reject()
+    return data
+
+
+def read_regular_file(path):
+    # Bounded, symlink-safe read for non-secret operator inputs (e.g. PEM cert).
+    if '..' in path.parts:
+        reject()
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            reject()
         data = f.read(MAX_BYTES + 1)
     if len(data) > MAX_BYTES:
         reject()
@@ -1245,7 +1260,7 @@ class Manager:
             scratch = self.scratch()
             cert, key = scratch / 'cert.pem', scratch / 'key.pem'
             write_new(key, read_secret(a.key), 0o600)
-            write_new(cert, a.cert.read_bytes(), 0o644)
+            write_new(cert, read_regular_file(a.cert), 0o644)
             a.cert, a.key = cert, key
         policy, sni = None, None
         if kind == 'anytls':
@@ -1783,7 +1798,9 @@ def check(binary, data, root, directory, source_tls=False, modern=False):
         if not isinstance(value, str) or not value or any(ord(c) < 32 or ord(c) == 127 for c in value) or '..' in Path(value).parts:
             reject()
         path = root / value.lstrip('/')
-        if not path.resolve().is_relative_to(root):
+        try:
+            path.resolve().relative_to(root.resolve())
+        except ValueError:
             reject()
         return str(path)
 
@@ -1993,7 +2010,7 @@ class Menu:
             for index, method in enumerate(methods, 1):
                 self.item(index, method + ('（默认）' if method == DEFAULT_METHOD else ''))
             answer = ask('加密方式（回车默认 ' + DEFAULT_METHOD + '）: ')
-            values['method'] = methods[int(answer) - 1] if answer and answer.isdigit() and 1 <= int(answer) <= len(methods) else DEFAULT_METHOD
+            values['method'] = methods[int(answer) - 1] if answer and answer.isascii() and answer.isdigit() and 1 <= int(answer) <= len(methods) else DEFAULT_METHOD
         if kind == 'socks5':
             values['username'] = ask('用户名（回车随机）: ') or None
         values['credential'] = ask_secret(('密钥' if kind == 'ss' and values['method'].startswith('2022-') else '密码') + '（回车随机生成）: ') or None

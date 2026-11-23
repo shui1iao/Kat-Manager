@@ -1,5 +1,11 @@
 # 更新日志
 
+## v0.1.3 (2026-11-23)
+
+- **Python 3.8 兼容修复**：`check()` 内路径归属校验改用 `Path.relative_to()` 替代 Python 3.9+ 专属 `is_relative_to()`，修复 Ubuntu 20.04 等旧系统下的 `AttributeError`。
+- **输入边界加固**：交互选择 Shadowsocks 加密方式补齐 `.isascii()` 校验防 Unicode 数字抛 `ValueError`；自备 `--cert` 快照读取改用 `O_NOFOLLOW` 与 `MAX_BYTES` 大小上限保护。
+- **文档对齐**：同步 `README.md` 版本说明至 `v0.1.3`。
+
 ## v0.1.2 (2026-11-23)
 
 - **内核下载源与发行版 wrapper 钉扎**：正式指向 `shui1iao/Kat-Server`；新增 `scripts/pin-helpers.sh --release-wrapper`，使 Release 附件 `kat.sh` 默认钉死在对应 tag 的 40 位提交 ID，彻底避免后续 `main` 更新导致历史 Release 附件 SHA-256 校验失败。
