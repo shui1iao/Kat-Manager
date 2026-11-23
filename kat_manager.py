@@ -38,7 +38,7 @@ import urllib.request
 from kat_config import (ERROR, KINDS, MAX_BYTES, METHODS, PROTOCOL, SAFE_PATH, credential, domain_name, listen,
                         loads, markers, node, reject, text, tls_matches, unit, unit_sni, unit_tls_policy)
 
-VERSION = '0.1.1'
+VERSION = '0.1.2'
 BIN = '/usr/local/bin/kat'
 # No trustworthy digest exists for an arbitrary legacy rollback file; leave it alone.
 OLD_ROLLBACK = '/usr/local/bin/kat.rollback'

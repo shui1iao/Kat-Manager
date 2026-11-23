@@ -13,10 +13,10 @@
 # A download/verification failure changes nothing.
 set -Eeuo pipefail
 
-KAT_MANAGER_VERSION="0.1.1"
+KAT_MANAGER_VERSION="0.1.2"
 # Filled with the full tagged commit ID only in a generated release wrapper.
 KAT_HELPER_REF=""
-KAT_HELPER_MANAGER_SHA256="42c374313835b8749f82a480ed006cd47bc5f909c132a4dd2fe71001347b03e2"
+KAT_HELPER_MANAGER_SHA256="0da5425502e990d839ea41a851b04d870f1ed52f8183dc3cd4a787407ee468d2"
 KAT_HELPER_CONFIG_SHA256="61f50695f7af774f5feec6b95fb1bdad46da0268a96b0ec1f74597d58fbbbeae"
 
 kat_src="${BASH_SOURCE[0]:-}"

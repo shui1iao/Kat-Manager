@@ -1,5 +1,15 @@
 # 更新日志
 
+## v0.1.2 (2026-11-23)
+
+- **内核下载源与发行版 wrapper 钉扎**：正式指向 `shui1iao/Kat-Server`；新增 `scripts/pin-helpers.sh --release-wrapper`，使 Release 附件 `kat.sh` 默认钉死在对应 tag 的 40 位提交 ID，彻底避免后续 `main` 更新导致历史 Release 附件 SHA-256 校验失败。
+- **归属与权限加固**：
+  - 状态页不再以 root 执行归属不明的二进制；
+  - `--binary` 本地安装先复制到受控私有目录并核验摘要后再执行，消除 TOCTOU；
+  - 私有目录与关键父路径同时核验属主与权限位；
+  - 卸载复用完整 unit/`ExecStart`/systemd `FragmentPath`/`DropInPaths` 归属核验，purge 删共享二进制前重验 SHA-256，仅清理有归属证据的证书/状态文件。
+- **运维安全与交互细节**：首装失败按记账回滚；非 TTY 日常安装/修改默认不输出明文密码、交互输入关闭回显、`--credential-file` 校验权限；`--host` 写前校验规范化；`--offline` 明确区分写入与启动状态。
+
 ## 0.1.1（2026-10-26）
 
 保留基础管理，只补查看日志与手改有效 0.7 配置的最低兼容。
