@@ -6,7 +6,6 @@ import base64
 import ipaddress
 import json
 import re
-import shlex
 import unicodedata
 from urllib.parse import urlsplit
 
@@ -952,17 +951,24 @@ def unit_body(kind, raw):
     """The service semantics of a Kat unit (ExecStart and the allowed directives), without manager markers."""
     if kind not in KINDS or not isinstance(raw, str) or len(raw.encode()) > MAX_BYTES:
         reject()
-    lines = raw.splitlines()
+    # systemd joins physical lines ending in a backslash. Only the manager's
+    # simple, unescaped command form is supported; do not emulate a shell.
+    if any(c not in '\n\t' and ord(c) < 32 for c in raw) or any(line.endswith('\\') for line in raw.splitlines()):
+        reject()
+    lines = raw.split('\n')
     starts = [line[len('ExecStart='):] for line in lines if line.startswith('ExecStart=')]
     if len(starts) != 1:
         reject()
-    args = shlex.split(starts[0])
+    args = starts[0].split()
+    if not re.fullmatch(r'[A-Za-z0-9_./+ \t-]+', starts[0]):
+        reject()
     if len(args) != 3 or not SAFE_PATH.fullmatch(args[0]) or '..' in args[0].split('/') or args[1:] != ['run', '/etc/kat/' + kind + '.json']:
         reject()
     # Reject alternate execution/configuration hooks rather than guessing which
     # systemd command is authoritative. Drop-ins are rejected by the collector.
-    allowed = {'Description', 'After', 'Wants', 'Type', 'User', 'Group', 'ExecStart',
-               'Restart', 'RestartSec', 'LimitNOFILE', 'WantedBy'}
+    allowed = {'[Unit]': {'Description', 'After', 'Wants'},
+               '[Service]': {'Type', 'User', 'Group', 'ExecStart', 'Restart', 'RestartSec', 'LimitNOFILE'},
+               '[Install]': {'WantedBy'}}
     seen = set()
     section = None
     for line in lines:
@@ -974,7 +980,7 @@ def unit_body(kind, raw):
             section = line
         else:
             key, sep, value = line.partition('=')
-            if not sep or key not in allowed or key in seen or (key == 'ExecStart' and section != '[Service]'):
+            if not sep or key not in allowed.get(section, ()) or key in seen:
                 reject()
             seen.add(key)
     return args[0]

@@ -12,6 +12,8 @@ import argparse
 import base64
 import copy
 import fcntl
+import getpass
+import warnings
 import hashlib
 import ipaddress
 import json
@@ -38,7 +40,7 @@ from kat_config import (ERROR, KINDS, MAX_BYTES, METHODS, PROTOCOL, SAFE_PATH, c
 
 VERSION = '0.1.1'
 BIN = '/usr/local/bin/kat'
-# Left behind by the previous Kat-mode release; removed after the next successful update.
+# No trustworthy digest exists for an arbitrary legacy rollback file; leave it alone.
 OLD_ROLLBACK = '/usr/local/bin/kat.rollback'
 STATE = '/var/lib/kat-manager'
 KERNEL_RECORD = STATE + '/kernel.json'
@@ -49,7 +51,7 @@ ALIASES = {'ss': 'ss', 'shadowsocks': 'ss', 'anytls': 'anytls', 'trojan': 'troja
 # ASSOCIATE uses an ephemeral port; AnyTLS/Trojan carry UDP inside TCP).
 UDP_KINDS = ('ss',)
 CERT_DIR = {'anytls': '/etc/kat/anytls', 'trojan': '/etc/kat/trojan'}
-SYSTEMD_DIRS = ('/etc/systemd/system', '/usr/lib/systemd/system', '/lib/systemd/system')
+SYSTEMD_DIRS = ('/etc/systemd/system', '/run/systemd/system', '/usr/lib/systemd/system', '/lib/systemd/system')
 RELEASE_BASE = 'https://github.com/shui1iao/Kat-Server/releases/download'
 RELEASE_LATEST = 'https://api.github.com/repos/shui1iao/Kat-Server/releases/latest'
 PUBLIC_IP = 'https://ipv4.icanhazip.com'
@@ -98,7 +100,9 @@ USAGE = '''Kat-Manager %s —— Kat 内核统一管理脚本（SS / AnyTLS / Tr
   --username NAME         SOCKS5 用户名；默认随机
   --cert F --key F        Trojan 自备证书（AnyTLS 另需 --tls-policy legacy-insecure --ack-certificate-change）
   --sni NAME              Trojan 自备证书时客户端使用的 SNI（默认取证书中的域名）
-  --host ADDR             节点输出使用的地址（默认查询公网 IPv4）
+  --host ADDR             节点输出有效 IP/域名（默认查询公网 IPv4）
+  --offline --root DIR    只在可信的非 / 隔离目录写文件，不操作实际服务
+  --sha256 HEX            远程内核可选带外摘要；默认始终核对同源 .sha256
   --purge                 uninstall 时不询问，直接删除
 ''' % VERSION
 
@@ -163,6 +167,33 @@ def read(path):
     return data.decode('utf-8')
 
 
+def trusted_dir(path, sticky=False):
+    st = path.lstat()
+    if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or
+            (st.st_mode & 0o022 and not (sticky and st.st_mode & stat.S_ISVTX))):
+        fail('目录属主或写权限不安全：' + str(path))
+
+
+def checked_file(st, private=False):
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & (0o077 if private else 0o022):
+        fail('文件类型、属主或权限不安全；请人工检查')
+
+
+def read_secret(path):
+    # Check the opened object rather than trusting a preceding stat by name.
+    if '..' in path.parts:
+        reject()
+    for parent in reversed(path.absolute().parents):
+        trusted_dir(parent, sticky=True)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as f:
+        checked_file(os.fstat(f.fileno()), private=True)
+        data = f.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        reject()
+    return data
+
+
 def trace(path):
     return path.exists() or path.is_symlink()
 
@@ -170,10 +201,14 @@ def trace(path):
 def write_new(path, data, mode):
     # O_EXCL: existing keys/configs are never silently overwritten on install.
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    with os.fdopen(fd, 'wb') as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        path.unlink()
+        raise
 
 
 def write_atomic(path, data, mode):
@@ -198,10 +233,10 @@ def private_dir(path, tighten=False, shown=None):
         reject()
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     st = os.lstat(path)
-    if not stat.S_ISDIR(st.st_mode):
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
         reject()
-    if st.st_mode & 0o077:
-        if not tighten or st.st_uid != os.geteuid():
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        if not tighten or st.st_mode & 0o022:
             reject()
         os.chmod(path, 0o700)
         print('提示：已把 ' + (shown or str(path)) + ' 的权限从 ' + oct(st.st_mode & 0o777)[2:].zfill(4) +
@@ -224,7 +259,10 @@ def binary_hash(path):
 
 def kat_version(path):
     try:
-        out = subprocess.run([str(path), 'version'], capture_output=True, text=True, timeout=15).stdout
+        proc = subprocess.run([str(path), 'version'], capture_output=True, text=True, timeout=15)
+        if proc.returncode:
+            return None
+        out = proc.stdout
     except (OSError, subprocess.SubprocessError):
         return None
     match = re.fullmatch(r'kat ([0-9]+\.[0-9]+\.[0-9]+)\s*', out)
@@ -240,6 +278,9 @@ def certificate(cert, key):
     """Operator/stored cert+key: regular files, a matching pair, not expired."""
     if cert.is_symlink() or key.is_symlink() or not cert.is_file() or not key.is_file():
         reject()
+    checked_file(key.lstat(), private=True)
+    for parent in reversed(key.absolute().parents):
+        trusted_dir(parent, sticky=True)
     ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(str(cert), str(key))
     if subprocess.run(['openssl', 'x509', '-in', str(cert), '-noout', '-checkend', '0'],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10).returncode:
@@ -337,6 +378,36 @@ def ask(question):
     return data.decode('utf-8', 'replace').strip()
 
 
+def ask_secret(prompt):
+    # Do not let getpass fall back to an echoed read from stdin.
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', getpass.GetPassWarning)
+        try:
+            with open('/dev/tty', 'w') as tty:
+                return getpass.getpass(prompt, stream=tty)
+        except (OSError, EOFError, getpass.GetPassWarning):
+            fail('没有可安全输入凭据的终端；请使用 --credential-file')
+
+
+def output_host(value):
+    try:
+        if not isinstance(value, str) or '%' in value:
+            reject()
+        if value.startswith('[') or value.endswith(']'):
+            if not (value.startswith('[') and value.endswith(']')):
+                reject()
+            return str(ipaddress.IPv6Address(value[1:-1]))
+        try:
+            return str(ipaddress.ip_address(value))
+        except ValueError:
+            if re.fullmatch(r'[0-9.]+', value):
+                reject()
+            domain_name(value)
+            return value
+    except ValueError:
+        fail('--host 必须是有效 IP 或 ASCII 域名')
+
+
 def have_tty():
     try:
         os.close(os.open('/dev/tty', os.O_RDWR | os.O_NOCTTY))
@@ -375,9 +446,14 @@ class Manager:
     def __init__(self, a):
         self.a = a
         self.kind = a.kind
-        root = a.root.resolve()
-        if not root.is_absolute() or (root != Path('/') and not a.offline):
-            fail('--root 只能与 --offline 一起用于隔离的 staging 目录')
+        if a.host is not None:
+            a.host = output_host(a.host)
+        root = a.root.absolute()
+        if root != root.resolve() or (root != Path('/')) != a.offline:
+            fail('--offline 必须搭配明确的非 / 隔离目录 --root；不接受链接或路径回退')
+        for parent in reversed(root.parents):
+            trusted_dir(parent, sticky=True)
+        trusted_dir(root)
         self.root = root
         self.staging = root != Path('/')
         # Test seams are honoured only for an isolated staging root.
@@ -402,11 +478,18 @@ class Manager:
     def owned(self, path):
         """A manager-owned path: no symlink below the root (no traversal/redirect)."""
         result = self.t(path)
-        for parent in (result, *result.parents):
-            if parent == self.root:
-                break
-            if parent.is_symlink():
-                reject()
+        # Parents must not be replaceable by another UID. /run/lock may be a
+        # root-owned sticky lock directory; the opened lock is checked below.
+        for parent in reversed(result.relative_to(self.root).parents):
+            folder = self.root / parent
+            if trace(folder):
+                trusted_dir(folder, sticky=(path == LOCK and folder == result.parent))
+        if result.is_symlink():
+            reject()
+        if result.is_dir():
+            trusted_dir(result)
+        elif trace(result):
+            checked_file(result.lstat())
         return result
 
     def config(self, kind):
@@ -439,6 +522,25 @@ class Manager:
         except (OSError, subprocess.SubprocessError):
             return None
         return result.stdout.strip()
+
+    def effective_unit(self, kind, expected):
+        # No host systemd queries in staging. Offline checks only cover the tree.
+        if self.a.offline:
+            return
+        name = 'kat-' + kind + '.service'
+        keys = ('LoadState', 'FragmentPath', 'DropInPaths', 'NeedDaemonReload')
+        cmd = ['systemctl', 'show', '--all', '--property=' + ','.join(keys), name]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        pairs = [line.partition('=') for line in result.stdout.splitlines()]
+        props = {key: value for key, sep, value in pairs if sep}
+        if len(pairs) == len(keys) and set(props) == set(keys) and not props['DropInPaths']:
+            if (not expected and result.returncode in (0, 4) and props['LoadState'] == 'not-found'
+                    and not props['FragmentPath']):
+                return
+            if (expected and result.returncode == 0 and props['LoadState'] == 'loaded'
+                    and props['FragmentPath'] == '/etc/systemd/system/' + name and props['NeedDaemonReload'] == 'no'):
+                return
+        fail(name + ' 生效单元来源、drop-in 或加载状态无法确认；已拒绝操作')
 
     def is_active(self, name):
         return self.query('is-active', name)
@@ -510,7 +612,7 @@ class Manager:
         if not trace(folder):
             return
         st = os.lstat(folder)
-        if not stat.S_ISDIR(st.st_mode) or st.st_mode & 0o077:
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
             fail(path + ' 必须是权限 0700 的目录（当前 ' + oct(st.st_mode & 0o777)[2:].zfill(4) +
                  '）；请人工确认后 chmod 700，未做任何改动')
 
@@ -518,8 +620,12 @@ class Manager:
     def lock(self):
         path = self.owned(LOCK)
         path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         self.keep.append(fd)
+        st = os.fstat(fd)
+        checked_file(st, private=True)
+        if st.st_nlink != 1:
+            reject()
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -541,7 +647,7 @@ class Manager:
         traces = self.kat_traces(kind)
         if not traces:
             return None
-        vendor = [p for p in traces if p.startswith(('/usr/', '/lib/')) and not p.endswith('.d')]
+        vendor = [p for p in traces if p.startswith(('/usr/', '/lib/', '/run/')) and not p.endswith('.d')]
         if vendor:
             return vendor[0] + ' 不是本脚本写入的单元'
         service = self.t('/etc/systemd/system/kat-' + kind + '.service')
@@ -604,13 +710,16 @@ class Manager:
         try:
             tag = json.loads(http_get(url, 1 << 20).decode()).get('tag_name')
         except (OSError, ValueError, AttributeError, urllib.error.URLError):
-            fail('无法获取 Kat 最新版本（' + url + '）；未做任何改动')
+            fail('无法获取 Kat 最新版本；未做任何改动')
         if not isinstance(tag, str) or not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
             fail('Kat 最新版本标签无效；未做任何改动')
         return tag[1:]
 
     def scratch(self):
-        folder = tempfile.TemporaryDirectory(prefix='kat-manager-')
+        base = Path(tempfile.gettempdir()).absolute()
+        for parent in (*reversed(base.parents), base):
+            trusted_dir(parent, sticky=True)
+        folder = tempfile.TemporaryDirectory(prefix='kat-manager-', dir=base)
         self.keep.append(folder)
         return Path(folder.name)
 
@@ -621,9 +730,12 @@ class Manager:
         if not VERSION_RE.fullmatch(version):
             fail('版本号格式应为 X.Y.Z')
         base = (os.environ.get('KAT_RELEASE_BASE_URL') or RELEASE_BASE).rstrip('/')
+        pin = self.a.sha256
+        if pin is not None and not re.fullmatch('[0-9a-f]{64}', pin):
+            fail('--sha256 必须是 64 位小写十六进制')
         asset = 'kat-' + version + '-linux-amd64'
         url = base + '/v' + version + '/' + asset
-        info('下载 Kat ' + version + '：' + url)
+        info('下载 Kat ' + version + '：' + asset)
         try:
             sums = http_get(url + '.sha256', 4096).decode('ascii')
             data = http_get(url, MAX_DOWNLOAD, timeout=300)
@@ -632,7 +744,7 @@ class Manager:
         match = re.fullmatch(r'([0-9a-f]{64})  (\S+)\n?', sums)
         if not match or match[2] != asset:
             fail('.sha256 文件内容或文件名与 ' + asset + ' 不符；未做任何改动')
-        if hashlib.sha256(data).hexdigest() != match[1]:
+        if hashlib.sha256(data).hexdigest() != match[1] or (pin and match[1] != pin):
             fail('Kat ' + version + ' SHA256 校验失败；未做任何改动')
         path = self.scratch() / asset
         path.write_bytes(data)
@@ -647,32 +759,36 @@ class Manager:
         self.arch()
         if not digest or not re.fullmatch('[0-9a-f]{64}', digest):
             fail('--binary 需要同时给出 --sha256（64 位小写十六进制）')
-        if binary_hash(binary) != digest:
-            fail('--binary 的 SHA256 与 --sha256 不符；未做任何改动')
-        reported = kat_version(binary)
-        if version and reported != version:
-            fail('--binary 报告的版本与 --version 不符；未做任何改动')
         path = self.scratch() / 'kat'
-        shutil.copyfile(binary, path)
-        path.chmod(0o755)
+        fd = os.open(binary, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, 'rb') as src:
+            st = os.fstat(src.fileno())
+            if not stat.S_ISREG(st.st_mode) or not st.st_mode & 0o111:
+                fail('--binary 不是可执行的普通文件')
+            with path.open('xb') as dst:
+                shutil.copyfileobj(src, dst)
         if file_hash(path) != digest:
-            fail('复制本地二进制后校验失败；未做任何改动')
-        return path, reported or 'unknown', digest, 'local'
+            fail('--binary 副本的 SHA256 与 --sha256 不符；未执行')
+        path.chmod(0o700)
+        reported = kat_version(path)
+        if reported is None or (version and reported != version):
+            fail('--binary 版本未知或与 --version 不符；未做任何改动')
+        return path, reported, digest, 'local'
 
     def candidate(self):
         if self.a.binary:
             return self.local(self.a.binary, self.a.sha256, self.a.version)
-        if self.a.sha256:
-            fail('--sha256 只能与 --binary 一起使用')
         return self.fetch(self.a.version)
 
     def place(self, source, digest):
         """Stage a verified file next to /usr/local/bin/kat (same filesystem, for rename)."""
         folder = self.owned('/usr/local/bin')
         folder.mkdir(mode=0o755, parents=True, exist_ok=True)
-        staged = folder / ('.kat.new-' + str(os.getpid()))
+        fd, name = tempfile.mkstemp(prefix='.kat.new-', dir=folder)
+        staged = Path(name)
         try:
-            shutil.copyfile(source, staged)
+            with os.fdopen(fd, 'wb') as dst, source.open('rb') as src:
+                shutil.copyfileobj(src, dst)
             staged.chmod(0o755)
             if file_hash(staged) != digest:
                 fail('写入 ' + BIN + ' 前校验失败')
@@ -695,8 +811,8 @@ class Manager:
                     fail('--binary 的 SHA256 与 --sha256 不符；未做任何改动')
                 if a.sha256 != record['sha256']:
                     fail('--binary 与已安装的受管内核不同；请用 bash kat.sh update --binary ... --sha256 ...')
-            elif a.sha256:
-                fail('--sha256 只能与 --binary 一起使用')
+            elif a.sha256 is not None and a.sha256 != record['sha256']:
+                fail('--sha256 与已安装的受管内核不符')
             info('复用已安装的 Kat 内核 ' + record['version'] + '（' + BIN + '）')
             return self.owned(BIN), (lambda: False), record
         path, version, digest, source = self.candidate()
@@ -704,9 +820,19 @@ class Manager:
 
         def commit():
             staged = self.place(path, digest)
-            os.replace(staged, self.owned(BIN))
-            self.write_kernel_record(record)
-            ok('已安装 Kat 内核 ' + version + ' 到 ' + BIN)
+            try:
+                os.link(staged, self.owned(BIN))  # exclusive first install
+            finally:
+                staged.unlink()
+            try:
+                self.fault('install-kernel-record')
+                self.write_kernel_record(record)
+            except BaseException:
+                installed = self.owned(BIN)
+                if file_hash(installed) != digest:
+                    fail('内核记录写入失败且文件已发生变化；保留内核供人工检查')
+                installed.unlink()
+                raise
             return True
         return path, commit, record
 
@@ -714,47 +840,57 @@ class Manager:
         """Create a 0700 directory; returns [topmost directory this call created]
         (missing parents included) so an undo removes exactly that."""
         folder = self.owned(path)
-        top = self.first_missing(folder)
+        missing = self.missing_dirs(folder)
         private_dir(folder)
-        return [] if top is None else [top]
+        return missing
 
     @staticmethod
-    def first_missing(folder):
-        top = None
+    def missing_dirs(folder):
+        missing = []
         while not trace(folder):
-            top, folder = folder, folder.parent
-        return top
+            missing.append(folder)
+            folder = folder.parent
+        return list(reversed(missing))
 
-    def undo_created(self, created, fresh, kind):
-        """Remove files/directories one change created (reverse order), and the
-        core it installed when no other Kat service uses it. Never raises."""
-        try:
-            if fresh and not self.other_present(kind):
-                self.remove_kernel()
-        except (OSError, ValueError):
-            pass
+    def undo_created(self, created, fresh, kind, digest):
+        leftover = []
         unit_written = False
+        if fresh:
+            try:
+                if any(self.kat_traces(other) for other in KINDS if other != kind):
+                    fail('其他协议仍在，保留共享内核')
+                self.remove_kernel(digest)
+            except (Fail, OSError, ValueError):
+                leftover.append(BIN + ' / ' + KERNEL_RECORD)
         for path in reversed(created):
             try:
                 if path.is_dir() and not path.is_symlink():
-                    shutil.rmtree(path)
-                else:
-                    unit_written = unit_written or path.name.endswith('.service')
+                    path.rmdir()   # never recurse into a shared parent
+                elif trace(path):
+                    unit_written |= path.name.endswith('.service')
                     path.unlink(missing_ok=True)
             except OSError:
-                pass
-        if unit_written:
-            self.ctl('daemon-reload', check=False)
+                leftover.append(self.shown(path))
+        if unit_written and not self.ctl('daemon-reload', check=False):
+            leftover.append('systemd daemon-reload')
+        return leftover
 
-    def remove_kernel(self):
-        for path in (BIN, OLD_ROLLBACK, KERNEL_RECORD):
-            self.owned(path).unlink(missing_ok=True)
-        # Empty Kat-Manager directories go too (anything else in them stays).
-        for path in (STATE, '/etc/kat'):
+    def remove_kernel(self, expected):
+        # Re-read independently at the destructive boundary, under the lock.
+        if self.managed_kernel(required=True)['sha256'] != expected:
+            fail('共享内核摘要已改变；保留内核及记录')
+        self.owned(BIN).unlink()
+        self.owned(KERNEL_RECORD).unlink()
+        if trace(self.t(OLD_ROLLBACK)):
+            warn('旧回滚文件无可信摘要，已保留：' + OLD_ROLLBACK)
+
+    def prune(self, path):
+        folder = self.owned(path)
+        if trace(folder):
             try:
-                os.rmdir(self.owned(path))
+                folder.rmdir()
             except OSError:
-                pass
+                warn('目录非空或无法清理，已保留：' + path)
 
     # ------------------------------------------------------------- installs
     def trojan_tls(self, kind, raw_unit, current):
@@ -776,18 +912,21 @@ class Manager:
         checks are still mandatory; no other unit's journal may be selected."""
         traces = self.kat_traces(kind)
         if not traces:
+            self.effective_unit(kind, expected=False)
             return None
         self.refuse_foreign(kind)
         if any(p.endswith('.d') for p in traces):
             fail('kat-' + kind + '.service 有 drop-in，实际启动参数无法确定；已拒绝操作')
         self.config(kind)  # reject redirected/symlink config paths, even for logs
+        self.check_private('/etc/kat')
         raw_unit = read(self.service(kind))
         binary, digest = unit(kind, raw_unit)
         if binary != BIN:
             fail('kat-' + kind + '.service 的 ExecStart 使用 ' + binary + '，不是 ' + BIN + '；本脚本只管理 ' + BIN)
-        path = self.owned(BIN)
-        if not path.is_file() or file_hash(path) != digest:
+        record = self.managed_kernel(required=True)
+        if record['sha256'] != digest:
             reject()
+        self.effective_unit(kind, expected=True)
         return raw_unit, digest
 
     def modern(self, binary=None):
@@ -799,7 +938,7 @@ class Manager:
         if owned is None:
             return None
         raw_unit, digest = owned
-        data = loads(read(self.config(kind)))
+        data = loads(read_secret(self.config(kind)).decode('utf-8'))
         modern = self.modern()
         current = node(kind, data, modern=modern)
         if modern:
@@ -837,6 +976,8 @@ class Manager:
         folder = self.owned('/etc/kat')
         if not trace(folder):
             folder = self.scratch()
+        else:
+            self.check_private('/etc/kat')
         check(str(binary), data, self.root, folder, source_tls=source_tls, modern=self.modern(binary))
 
     def unit_text(self, kind, digest, policy=None, sni=None):
@@ -852,6 +993,8 @@ class Manager:
     def host(self):
         if self.a.host is not None:
             return self.a.host
+        if self.a.offline:
+            return PLACEHOLDER
         url = os.environ.get('KAT_PUBLIC_IP_URL') or PUBLIC_IP
         try:
             value = http_get(url, 256, timeout=8).decode('ascii').strip()
@@ -861,6 +1004,12 @@ class Manager:
             pass
         print('未能获取公网 IPv4，节点地址使用占位 ' + PLACEHOLDER + '（可用 --host 指定）', file=sys.stderr, flush=True)
         return PLACEHOLDER
+
+    def show_after_change(self, kind, value):
+        if sys.stdout.isatty():
+            display(kind, self.host(), value)
+        else:
+            info('非终端输出已隐藏节点凭据；需要导出请显式使用 view ' + kind)
 
     def build(self, kind, address, password, method=None, username=None):
         inbound = {'protocol': PROTOCOL[kind], 'listen': address}
@@ -899,7 +1048,7 @@ class Manager:
             if kind == exclude:
                 continue
             try:
-                ports[listen(loads(read(self.t('/etc/kat/' + kind + '.json')))['inbounds'][0]['listen'])[1]] = \
+                ports[listen(loads(read_secret(self.config(kind)).decode('utf-8'))['inbounds'][0]['listen'])[1]] = \
                     'Kat ' + LABEL[kind] + ' 的配置 /etc/kat/' + kind + '.json'
             except (ValueError, KeyError, TypeError, IndexError, OSError):
                 pass
@@ -963,7 +1112,7 @@ class Manager:
     def credential_input(self):
         a = self.a
         if a.credential_file:
-            return read(a.credential_file)
+            return read_secret(a.credential_file).decode('utf-8')
         return getattr(a, 'credential', None)
 
     def do_view(self):
@@ -1023,6 +1172,9 @@ class Manager:
         self.check(self.owned(BIN), item['data'])
         name = 'kat-' + self.kind + '.service'
         self.ctl(action, name)
+        if self.a.offline:
+            info('离线模拟：未操作实际服务 ' + name)
+            return
         if action != 'stop' and self.wait_active(name) is False:
             fail(name + ' 未能进入 active；请查看 journalctl -u ' + name)
         ok(name + ' ' + {'start': '已启动', 'stop': '已停止', 'restart': '已重启'}[action])
@@ -1043,6 +1195,7 @@ class Manager:
 
     def do_install(self):
         a, kind = self.a, self.kind
+        self.check_private('/etc/kat')
         self.option_kinds()
         # One node per protocol: an existing installation is never overwritten.
         try:
@@ -1083,7 +1236,17 @@ class Manager:
                 text(password)
         except ValueError:
             fail('凭据不合法（不能为空、不能含控制字符；SS2022 需要对应长度的 Base64 密钥）；未做任何改动')
-        source_tls = None          # (cert, key) checked from their source location
+        source_tls = None
+        if a.cert and a.key:
+            # Snapshot both inputs privately; validation and installation must
+            # use the same bytes, even when the operator renews a certificate.
+            if a.cert.is_symlink() or not a.cert.is_file():
+                reject()
+            scratch = self.scratch()
+            cert, key = scratch / 'cert.pem', scratch / 'key.pem'
+            write_new(key, read_secret(a.key), 0o600)
+            write_new(cert, a.cert.read_bytes(), 0o644)
+            a.cert, a.key = cert, key
         policy, sni = None, None
         if kind == 'anytls':
             if a.cert or a.key:
@@ -1136,12 +1299,17 @@ class Manager:
         except ValueError:
             fail('新配置未通过 kat check；未做任何改动')
         raw_unit = self.unit_text(kind, record['sha256'], policy if kind in CERT_DIR else None, sni)
+        if source_tls:
+            raw_unit += '# Kat-Cert-Files-SHA256=' + ' '.join(file_hash(f) for f in source_tls) + '\n'
         unit(kind, raw_unit)
-        # Pre-flight (nothing changed yet): directory permissions.
         self.check_private('/etc/kat')
         self.prepare_state()
-        top = self.first_missing(self.owned(STATE))
-        fresh, created = False, [] if top is None else [top]
+        fresh, created = False, []
+        # A staging tree may lack system parents that always exist on a host.
+        for name in ('/usr/local/bin', STATE, '/etc/systemd/system'):
+            for directory in self.missing_dirs(self.owned(name)):
+                if directory not in created:
+                    created.append(directory)
         try:
             fresh = commit()
             created += self.make_private('/etc/kat')
@@ -1149,7 +1317,9 @@ class Manager:
                 created += self.make_private(CERT_DIR[kind])
                 folder = self.owned(CERT_DIR[kind])
                 write_new(folder / 'key.pem', Path(source_tls[1]).read_bytes(), 0o600)
+                created.append(folder / 'key.pem')
                 write_new(folder / 'cert.pem', Path(source_tls[0]).read_bytes(), 0o644)
+                created.append(folder / 'cert.pem')
             self.service(kind).parent.mkdir(parents=True, exist_ok=True)
             write_new(self.config(kind), encoded, 0o600)
             created.append(self.config(kind))
@@ -1157,25 +1327,29 @@ class Manager:
             write_new(self.service(kind), raw_unit.encode(), 0o644)
             created.append(self.service(kind))
             self.ctl('daemon-reload')
+            self.effective_unit(kind, expected=True)
         except BaseException as e:
             # No service was touched: remove exactly what this install created.
-            self.undo_created(created, fresh, kind)
+            left = self.undo_created(created, fresh, kind, record['sha256'])
             if isinstance(e, (Fail, OSError, ValueError, subprocess.SubprocessError)):
-                fail('安装 kat-' + kind + ' 未完成（' + reason(e) + '）；已清理本次写入的文件' +
-                     ('和内核' if fresh else '') + '，其他服务未受影响')
+                fail('安装 kat-' + kind + ' 未完成（' + reason(e) + '）；' + ('请检查残留：' + '、'.join(left) if left else '已撤销本次写入'))
             raise
         try:
             self.ctl('enable', '--now', 'kat-' + kind + '.service')
             started = self.wait_active('kat-' + kind + '.service')
-        except Fail:
+        except (Fail, OSError, subprocess.SubprocessError):
             started = False
         if started is False:
-            err('kat-' + kind + '.service 未能进入 active；配置已写入，请查看 journalctl -u kat-' + kind +
-                '.service（例如端口被占用时可 bash kat.sh modify ' + kind + ' --port N）')
-            display(kind, self.host(), final)
-            sys.exit(1)
-        ok('已安装并启动 kat-' + kind + '.service')
-        display(kind, self.host(), final)
+            # enable --now can partially succeed. Never remove a live unit or
+            # binary unless the same unit is still ours and was quiesced.
+            self.managed_unit(kind)
+            name = 'kat-' + kind + '.service'
+            if not self.ctl('disable', '--now', name, check=False):
+                fail('安装启动失败且无法确认已停用；保留受管文件，请检查 ' + name)
+            left = self.undo_created(created, fresh, kind, record['sha256'])
+            fail('安装启动失败；' + ('请检查残留：' + '、'.join(left) if left else '已撤销本次写入'))
+        ok(('已写入隔离目录；未实际启动 ' if a.offline else '已安装并启动 ') + 'kat-' + kind + '.service')
+        self.show_after_change(kind, final)
 
     def valid_sni(self, cert, sni):
         try:
@@ -1260,9 +1434,13 @@ class Manager:
         # The atomic write is the last step that can fail before the service is touched.
         self.fault('modify-write-config')
         write_atomic(config, encoded, 0o600)
+        if self.a.offline and not self.stub:
+            ok('隔离目录配置已更新；未操作实际服务')
+            self.show_after_change(kind, final)
+            return
         if state not in ('active', None):
             ok('配置已更新；' + name + ' 当前未运行（' + str(state) + '），下次启动时生效')
-            display(kind, self.host(), final)
+            self.show_after_change(kind, final)
             return
         try:
             self.fault('modify-after-write')
@@ -1271,8 +1449,8 @@ class Manager:
         except (Fail, OSError, subprocess.SubprocessError):
             started = False
         if started is not False:
-            ok('配置已更新，' + name + ' 已重启')
-            display(kind, self.host(), final)
+            ok('隔离目录配置已更新；未操作实际服务' if self.a.offline else '配置已更新，' + name + ' 已重启')
+            self.show_after_change(kind, final)
             return
         # The new configuration does not run: put the old one back and restart it.
         try:
@@ -1303,8 +1481,8 @@ class Manager:
             if running.get(kind) in ('active', None):
                 if attempted is not None:
                     attempted.append(name)
-                self.ctl('restart', name, check=False)
-                if self.wait_active(name) is False:
+                self.effective_unit(kind, expected=True)
+                if not self.ctl('restart', name, check=False) or self.wait_active(name) is False:
                     failed.append(name)
         return failed
 
@@ -1321,16 +1499,11 @@ class Manager:
         items = self.installs()
         self.prepare_state()
         a = self.a
-        if a.binary and a.sha256 == record['sha256']:
-            ok('当前内核已是该二进制（' + record['version'] + '），未做任何改动')
-            return
         if not a.binary:
-            if a.sha256:
-                fail('--sha256 只能与 --binary 一起使用')
             self.arch()
             requested = a.version
             version = requested or self.latest()
-            if version == record['version'] and record.get('source') != 'local':
+            if version == record['version'] and record.get('source') != 'local' and a.sha256 in (None, record['sha256']):
                 ok(('当前内核已是 ' + version if requested else '已是最新版本（' + version + '）') + '，未做任何改动')
                 return
             a.version = version
@@ -1372,19 +1545,12 @@ class Manager:
             error = e
         if not failed and error is None:
             hold.unlink(missing_ok=True)
-            cleaned = False
-            try:
-                if trace(self.owned(OLD_ROLLBACK)):
-                    self.owned(OLD_ROLLBACK).unlink()
-                    cleaned = True
-            except (OSError, ValueError):
-                pass
-            ok('Kat 内核更新完成：' + old['version'] + ' -> ' + new['version'] + '（不保留旧版本）')
-            if cleaned:
-                info('已清理上一版遗留的 ' + OLD_ROLLBACK)
+            ok('Kat 内核更新完成：' + old['version'] + ' -> ' + new['version'])
+            if trace(self.t(OLD_ROLLBACK)):
+                warn('旧回滚文件无可信摘要，已保留：' + OLD_ROLLBACK)
             for kind in items:
                 info('已刷新 kat-' + kind + '.service 的 KatManagerSHA256' +
-                     ('，并已重启' if running.get(kind) in ('active', None) else '（服务未运行，未重启）'))
+                     ('；未操作实际服务' if self.a.offline else ('，并已重启' if running.get(kind) == 'active' else '（未确认运行）')))
             return
         # Automatic revert to the core kept at the private hard link.
         problems = []
@@ -1419,107 +1585,108 @@ class Manager:
         sys.exit(1)
 
     # --------------------------------------------------------------- uninstall
-    def other_present(self, kind):
-        return any(self.kat_traces(other) for other in KINDS if other != kind)
-
     def do_uninstall(self):
         self.no_edit_flags()
         self.no_kernel_flags()
         kind = self.kind
-        if not self.kat_traces(kind):
+        installation = self.managed_unit(kind)
+        if installation is None:
             fail('未安装 Kat ' + LABEL[kind])
-        self.refuse_foreign(kind)
-        if any(p.endswith('.d') for p in self.kat_traces(kind)):
-            fail('kat-' + kind + '.service 有 drop-in；不支持，已拒绝操作')
+        raw_unit, digest = installation
         name = 'kat-' + kind + '.service'
-        present = trace(self.service(kind))
-        # Pre-flight, before the service is touched: the decision and the
-        # private stash directory a purge needs.
-        if self.a.purge:
-            purge = True
-        else:
-            answer = ask('是否删除 Kat ' + LABEL[kind] + ' 的配置、证书和单元文件？[y/N]: ')
+        purge = self.a.purge
+        if not purge:
+            answer = ask('是否删除 Kat ' + LABEL[kind] + ' 的受管文件？[y/N]: ')
             purge = bool(answer) and answer.lower() in ('y', 'yes')
-            if answer is None:
-                info('非交互环境且未给 --purge：保留配置、证书和单元文件')
-        folder = None
+        # A tty confirmation may have waited arbitrarily long. Re-establish
+        # unit, effective systemd paths and current record at the boundary.
+        if self.managed_unit(kind) != installation:
+            fail('等待确认期间受管单元已改变；未停用或删除')
+        before = self.unit_state(name)
+        if not self.a.offline and (not all(before) or before[1] not in ('active', 'inactive', 'failed')):
+            fail('无法确认卸载前的服务状态；请稍后重试')
+        folder, items = None, []
         if purge:
-            for path, _ in self.stash_items(kind):
-                self.owned(path)
+            items = self.purge_items(kind, raw_unit)
             self.prepare_state()
-            folder = self.stash_dir(kind)
-        before = self.unit_state(name) if present else None
+            private_dir(self.owned(STATE))
+            folder = Path(tempfile.mkdtemp(prefix='.uninstall-' + kind + '-', dir=self.owned(STATE)))
+        moved = []
         try:
-            if present:
-                self.ctl('disable', '--now', name)
+            self.ctl('disable', '--now', name)
             if purge:
                 self.fault('uninstall-stash')
-                self.stash_into(kind, folder)
+                for path in items:
+                    dst = folder / path.name
+                    self.fault('stash-move')
+                    shutil.move(str(path), str(dst))
+                    moved.append((path, dst))
                 self.ctl('daemon-reload')
         except (Fail, OSError, ValueError, subprocess.SubprocessError) as e:
-            restored_files = self.unstash(kind, folder) if folder else True
-            back = self.restore_unit(name, before) if present else True
-            files = '配置、证书和单元已放回原处' if restored_files else '部分文件未能放回，见 ' + self.shown(folder)
-            if not present:
-                service = ''
-            elif back:
-                service = '，' + name + ' 已恢复为 ' + self.describe(before)
-            else:
-                service = '，' + name + ' 未能恢复原状态（原为 ' + self.describe(before) + '），请人工检查'
-            err('卸载 Kat ' + LABEL[kind] + ' 失败（' + reason(e) + '）；' + files + service)
-            sys.exit(1)
-        if not purge:
-            ok('已停止并禁用 ' + name + '；配置、证书和单元文件均已保留')
-            info('保留 ' + BIN + '（只有删除文件且其他 Kat 服务都不存在时才删除内核）')
-            return
-        # The service is gone on purpose; what is left is cleanup of the stash.
-        shutil.rmtree(folder, ignore_errors=True)
-        ok('已停止并删除 Kat ' + LABEL[kind] + ' 的配置、证书和单元文件')
-        others = [k for k in KINDS if k != kind and self.kat_traces(k)]
-        if others:
-            info('其他 Kat 服务（' + '、'.join('kat-' + k for k in others) + '）仍在使用 ' + BIN + '，保留内核')
-            return
-        try:
-            self.remove_kernel()
-        except (OSError, ValueError) as e:
-            fail('kat-' + kind + ' 已删除，但删除内核时失败（' + reason(e) + '）；请人工检查 ' + BIN)
-        ok('已删除 ' + BIN + ' 和内核记录')
-
-    def stash_dir(self, kind):
-        """Private holding place for a purge (restored if the purge fails)."""
-        folder = self.owned(STATE + '/.uninstall-' + kind + '-' + str(os.getpid()))
-        private_dir(self.owned(STATE), tighten=True, shown=STATE)
-        private_dir(folder)
-        return folder
-
-    def stash_items(self, kind):
-        items = [('/etc/kat/' + kind + '.json', kind + '.json'),
-                 ('/etc/systemd/system/kat-' + kind + '.service', 'kat-' + kind + '.service')]
-        if kind in CERT_DIR:
-            items.append((CERT_DIR[kind], kind + '-certificates'))
-        return items
-
-    def stash_into(self, kind, folder):
-        """Move Kat config/unit/certificates into the stash."""
-        self.fault('stash-move')
-        for path, name in self.stash_items(kind):
-            if trace(self.owned(path)):
-                shutil.move(str(self.owned(path)), str(folder / name))
-
-    def unstash(self, kind, folder):
-        """Move stashed files back; drop the then-empty stash. True when complete."""
-        complete = True
-        for path, name in self.stash_items(kind):
-            if trace(folder / name):
+            for path, dst in reversed(moved):
                 try:
-                    shutil.move(str(folder / name), str(self.owned(path)))
-                except (OSError, ValueError):
-                    complete = False
+                    if not trace(path):
+                        shutil.move(str(dst), str(path))
+                except OSError:
+                    pass
+            if folder:
+                self.prune(self.shown(folder))
+            try:
+                back = bool(self.managed_unit(kind)) and self.restore_unit(name, before)
+            except (Fail, ValueError, OSError, subprocess.SubprocessError):
+                back = False
+            fail('卸载中止（' + reason(e) + '）；' + ('已尝试恢复原状态' if back else '请检查服务状态') +
+                 ('；检查暂存目录 ' + self.shown(folder) if folder and trace(folder) else ''))
+        ok(('隔离目录：未操作实际服务 ' if self.a.offline else '已停止并禁用 ') + name)
+        if not purge:
+            info('已保留配置、证书、单元和内核')
+            return
         try:
+            for _, dst in moved:
+                dst.unlink()  # only files in the verified plan; never recursive
             folder.rmdir()
         except OSError:
-            pass
-        return complete
+            fail('部分受管文件未能清除；检查暂存目录 ' + self.shown(folder))
+        if kind in CERT_DIR:
+            self.prune(CERT_DIR[kind])
+        for other in KINDS:
+            if other == kind:
+                continue
+            if self.kat_traces(other):
+                info('仍有其他 Kat 协议痕迹；保留共享内核')
+                return
+            self.effective_unit(other, expected=False)
+        self.remove_kernel(digest)
+        self.prune(STATE)
+        self.prune('/etc/kat')
+        ok('已删除经核实的共享内核及记录')
+
+    def purge_items(self, kind, raw_unit):
+        # The verified unit identifies its one JSON path. Unknown/malformed
+        # JSON is retained for the operator instead of inferring ownership.
+        items = [self.service(kind)]
+        self.check_private('/etc/kat')
+        config = self.config(kind)
+        if trace(config):
+            try:
+                data = loads(read_secret(config).decode('utf-8'))
+                node(kind, data, modern=True)
+                items.append(config)
+            except (OSError, ValueError, KeyError, TypeError, Fail):
+                warn('配置无法确认，已保留：' + self.shown(config))
+        if kind in CERT_DIR and trace(self.t(CERT_DIR[kind])):
+            self.check_private(CERT_DIR[kind])
+            sums = re.findall(r'^# Kat-Cert-Files-SHA256=([0-9a-f]{64}) ([0-9a-f]{64})$', raw_unit, re.M)
+            if len(sums) == 1:
+                for filename, digest in zip(('cert.pem', 'key.pem'), sums[0]):
+                    path = self.owned(CERT_DIR[kind] + '/' + filename)
+                    if path.is_file() and file_hash(path) == digest:
+                        items.append(path)
+                    elif trace(path):
+                        warn('证书材料已变化，已保留：' + self.shown(path))
+            else:
+                warn('无安装时的证书文件摘要；保留已有证书材料供人工处理')
+        return items
 
     # ------------------------------------------------------------- home page
     def diagnose(self, kind, error):
@@ -1531,7 +1698,7 @@ class Manager:
         try:
             raw = read(service)
             found = markers(raw)
-            if trace(self.t(BIN)) and found.get('SHA256') != file_hash(self.t(BIN)):
+            if trace(self.owned(BIN)) and found.get('SHA256') != file_hash(self.owned(BIN)):
                 return '单元的 KatManagerSHA256 与 ' + BIN + ' 不符'
         except (ValueError, OSError):
             return 'KatManager 标记重复或无效'
@@ -1542,6 +1709,7 @@ class Manager:
         已停止 / 已存在（非本脚本安装） / 异常."""
         try:
             if not self.kat_traces(kind):
+                self.effective_unit(kind, expected=False)
                 return '未安装', ''
             why = self.foreign(kind)
             if why:
@@ -1568,7 +1736,7 @@ class Manager:
         except (Fail, ValueError, OSError) as e:
             path = self.t(BIN)
             if path.is_file() and not trace(self.t(KERNEL_RECORD)):
-                return paint('RED', (kat_version(path) or '版本未知') + '（非本脚本安装）')
+                return paint('RED', '版本未知（非本脚本安装，未执行）')
             return paint('RED', '异常：' + (str(e) if isinstance(e, Fail) else '内核记录无法读取'))
         if record is None:
             return paint('RED', '未安装')
@@ -1637,7 +1805,10 @@ def check(binary, data, root, directory, source_tls=False, modern=False):
             # The kernel validates modern file-following/multi-cert/ACME TLS.
             # Keep private-key permissions and staging containment constraints.
             key = Path(pair['key']).resolve()
-            if key.stat().st_mode & 0o077 or key.parent.stat().st_mode & 0o077:
+            for parent in reversed(key.parents):
+                trusted_dir(parent, sticky=True)
+            checked_file(key.stat(), private=True)
+            if key.parent.stat().st_uid != os.geteuid() or key.parent.stat().st_mode & 0o077:
                 reject()
         acme = tls.get('acme')
         if isinstance(acme, dict):
@@ -1825,7 +1996,7 @@ class Menu:
             values['method'] = methods[int(answer) - 1] if answer and answer.isdigit() and 1 <= int(answer) <= len(methods) else DEFAULT_METHOD
         if kind == 'socks5':
             values['username'] = ask('用户名（回车随机）: ') or None
-        values['credential'] = ask(('密钥' if kind == 'ss' and values['method'].startswith('2022-') else '密码') + '（回车随机生成）: ') or None
+        values['credential'] = ask_secret(('密钥' if kind == 'ss' and values['method'].startswith('2022-') else '密码') + '（回车随机生成）: ') or None
         if kind == 'trojan':
             cert = ask('自备证书路径（回车使用自签证书）: ')
             if cert:
@@ -1839,7 +2010,7 @@ class Menu:
         values['port'] = self.port('新端口（回车不变）: ')
         if kind == 'socks5':
             values['username'] = ask('新用户名（回车不变）: ') or None
-        answer = ask('新' + ('密钥' if kind == 'ss' else '密码') + '（回车不变，输入 r 随机生成）: ')
+        answer = ask_secret('新' + ('密钥' if kind == 'ss' else '密码') + '（回车不变，输入 r 随机生成）: ')
         if answer in ('r', 'R'):
             method = None
             if kind == 'ss':

@@ -1,6 +1,6 @@
 # Kat-Manager
 
-当前版本：**v0.1.1**。
+当前开发树基于 **v0.1.1**；下列安全变更尚未发布，不代表现有线上 tag 或 Release 已更新。
 
 Kat 内核的统一管理脚本。一个入口 `kat.sh`，管理 Kat 支持的 4 种协议：
 
@@ -15,32 +15,25 @@ Kat 内核的统一管理脚本。一个入口 `kat.sh`，管理 Kat 支持的 4
 
 **安装就是安装**：只要端口不和别的程序或别的 Kat 协议冲突，就可以装，不影响其他协议，也不管机器上有没有 ss-rust、anytls 等其他服务。本脚本不读、不碰其他服务。
 
-## 一键安装
+## 入口与发布 wrapper
+
+在可信的完整 checkout 中运行 `bash kat.sh` 或 `bash kat.sh install ss`；本地模式直接使用同目录的两个 helper。需要 root 的操作不要在其他用户可写的 checkout 中执行。
+
+单文件入口分两种：
+
+- **开发入口**：仍可下载 `main/kat.sh` 单独运行，或执行 `curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh | bash`。它默认从可变的 `main` 取 helper，逐个匹配脚本内置 SHA256 后才执行。如果两次获取之间 main 发生变化且摘要不匹配，会直接拒绝；应重新获取相互匹配的脚本和 helper，而不是跳过校验。
+- **发布产物**：由下面的流程生成。它默认只从选定 tag 对应的完整 40 位提交 ID 取两个 helper，不会回退到 `main`。移动 main 不影响该产物的下载目标。
+
+两种远程模式均支持显式设置**传给 bash 的** `KAT_MANAGER_BASE_URL` 来指定受信镜像，都不会因此跳过内置摘要校验。脚本自身应从可信来源取得；摘要验证 helper，不替代对入口脚本来源的验证。
+
+维护者发布流程：由维护者决定版本，同步 `version.txt`、`kat.sh` 和 `kat_manager.py`，刷新 pin 并检查。待对应提交已有**维护者明确选择的**版本 tag 后，运行：
 
 ```bash
-# 交互首页（curl | bash 下菜单读 /dev/tty）
-curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh | bash
-
-# 非交互一键安装，全部用默认值
-curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh | bash -s -- install ss
-curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh | bash -s -- install anytls
-curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh | bash -s -- install trojan
-curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh | bash -s -- install socks5
-
-# 进程替换写法
-bash <(curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh) install trojan --port 443
-
-# 也可以 clone 后本地运行
-git clone https://github.com/shui1iao/Kat-Manager && cd Kat-Manager && bash kat.sh
+# TAG 由维护者指定；OUTPUT 是尚不存在的文件，发布时作为 kat.sh
+bash scripts/pin-helpers.sh --release-wrapper "$TAG" "$OUTPUT"
 ```
 
-`kat.sh` 单独运行时（curl | bash、`bash <(curl …)`、只下载了这一个文件），会从仓库 raw 下载 `kat_manager.py`、`kat_config.py`，并核对 `kat.sh` 里内置的 SHA256。下载失败或 hash 不符就直接退出，不做任何改动。下载地址可以用 `KAT_MANAGER_BASE_URL` 覆盖。注意这个变量要给 **bash**，不是给 curl：
-
-```bash
-curl -fsSL http://127.0.0.1:18080/kat.sh | KAT_MANAGER_BASE_URL=http://127.0.0.1:18080 bash -s -- install ss
-```
-
-本地 checkout（`kat.sh` 旁边有两个 helper）会直接用本地文件。
+工具只核对该 tag 解引用后的提交内容与本树是否一致，生成用该提交取 helper 的独立文件；不会建 tag、提交或发布。发布者应另行验证 tag/提交的来源与远端可达性，签名或通过可信渠道分发 wrapper，再发布生成的产物。不要将当前修改指向已有的旧 tag。本文不提供指向尚不存在的新 Release 的一键安装链接。
 
 ### 默认值
 
@@ -57,7 +50,7 @@ curl -fsSL http://127.0.0.1:18080/kat.sh | KAT_MANAGER_BASE_URL=http://127.0.0.1
   - Trojan：20 位随机密码。
   - SOCKS5：用户名 `kat` 加 7 位随机字符，密码 20 位随机。
 - 内核：GitHub Release 最新版，按 `.sha256` 校验。已经装了受管内核就直接复用，不再下载。
-- 节点地址：查询 `https://ipv4.icanhazip.com`；查不到就输出 `<服务器IP>` 占位。`--host` 只影响输出。
+- 节点地址：查询 `https://ipv4.icanhazip.com`；查不到就输出 `<服务器IP>` 占位。`--host` 只接受 IP 或 ASCII 域名并在动作前校验；IPv6 统一规范化。
 
 ## 首页
 
@@ -92,7 +85,7 @@ SOCKS5 ：未安装
   - **未安装**（黄，与 SS-Rust-Manager 一样用 `\033[0;35m`）。
   - **已存在（非本脚本安装）**（红，附原因）：`kat-<协议>.service` 是手写的（没有 `# KatManager*` 标记）、在 `/usr/lib` 或 `/lib` 下，或者只有 `/etc/kat/<协议>.json` 没有单元。本脚本不接管、不覆盖，安装和管理都拒绝。
   - **异常**（红，附原因）：本脚本的格式但无法可靠判定，例如标记重复/与配置或证书不符、单元 hash 与内核不符、有 drop-in、systemd 处于 activating 等过渡状态或无法查询。不会当成未安装。
-- 内核版本：`X.Y.Z`；`未安装`（红）；`X.Y.Z（非本脚本安装）`（红，`/usr/local/bin/kat` 存在但没有 `/var/lib/kat-manager/kernel.json`，本脚本不覆盖也不复用）。
+- 内核版本：`X.Y.Z`；`未安装`（红）；`版本未知（非本脚本安装，未执行）`（红，`/usr/local/bin/kat` 存在但没有 `/var/lib/kat-manager/kernel.json`，本脚本不覆盖也不复用）。
 - 只有标准输出是终端时才有颜色；管道、重定向或设置了 `NO_COLOR` 时没有任何 ANSI 码。curl | bash 时标准输出仍是终端，照常有颜色。
 - 没有交互终端时只打印状态总览，然后退出（非 0）。
 
@@ -274,7 +267,7 @@ AnyTLS 保持 AnyTLS-Manager 的行为：默认用随机证书（配置里不写
   3. 当前内核临时硬链接到 `/usr/local/bin/.kat.old-<pid>`，新内核在同一目录原子 rename 成 `/usr/local/bin/kat`。
   4. 刷新所有单元的 `KatManagerSHA256` 标记，重启原本在运行的服务（停止的不启动）。
   5. 任何一步失败（服务起不来、写单元/记录失败、`daemon-reload` 失败），自动把内核、单元和内核记录按字节退回更新前，并让原来在运行的服务重新运行。
-  6. 成功后删除旧内核，**不保留回滚件**；`kernel.json` 只记录 `{version, sha256, source}`。上一版留下的 `/usr/local/bin/kat.rollback` 会在这次成功更新后顺手删除，其他时候忽略。
+  6. 成功后删除旧内核，**不保留回滚件**；`kernel.json` 只记录 `{version, sha256, source}`。无法证明归属的旧 `kat.rollback` 不会删除，存在时会提示人工处理。
 
   下载/校验/check 失败都是零改动（不留临时文件）。
 - 已经是最新版本时提示「已是最新版本（X.Y.Z）」，不做任何改动；`--version` 等于当前版本时同样不改动。
@@ -286,8 +279,9 @@ AnyTLS 保持 AnyTLS-Manager 的行为：默认用随机证书（配置里不写
 - `uninstall <协议>`：停止并禁用服务，然后询问是否删除配置、证书和单元（默认保留）。
 - `--purge`：不询问，直接删除。
 - 非交互且没给 `--purge`：保留。
-- 只处理 Kat 自己的文件，不碰、也不会去启用其他服务（例如 ss-rust）。
-- 还有其他 Kat 服务（任何协议的配置或单元仍在）时保留内核。最后一个协议删除文件时，删除 `/usr/local/bin/kat`、`/var/lib/kat-manager/kernel.json`（以及上一版遗留的 `kat.rollback`），和空的 `/etc/kat`、`/var/lib/kat-manager`。
+- 停用前要求完整单元标记、固定 ExecStart/配置路径、受管内核记录与摘要；在线同时核对 systemd 生效的 FragmentPath、DropInPaths 及加载状态。无法证实则不操作。离线只能验证 staging 树。
+- 只删除受管单元和可识别的固定配置。只会清除匹配本版本安装时记录摘要的固定 cert.pem / key.pem，不递归删除证书目录。旧 unit 无证书摘要、文件变化、手工添加文件、损坏配置或清理失败时，保留未知数据并提示人工处理。
+- 还有其他 Kat 服务（任何协议的配置或单元仍在）时保留内核。最后一个协议 purge 时再次核对当前内核记录和 SHA256 后才删除内核与记录，只清理空目录；无归属证据的回滚件保留。
 
 ## 失败时的安全顺序
 
@@ -301,7 +295,11 @@ AnyTLS 保持 AnyTLS-Manager 的行为：默认用随机证书（配置里不写
    - uninstall：文件从暂存目录放回，服务恢复原状态。
    - update：见上一节。
 
-`/var/lib/kat-manager` 自身权限过宽（root 所有的真实目录）时收紧为 0700 并提示一行。`/etc/kat` 和证书目录不会自动改：权限不是 0700 时，会在任何改动之前拒绝，并提示人工 `chmod 700`。
+`/var/lib/kat-manager` 自身权限过宽（root 所有、不可被组或其他人写入的真实目录）时收紧为 0700 并提示一行。`/etc/kat` 和证书目录不会自动改：权限不是 0700 时，会在任何改动之前拒绝，并提示人工 `chmod 700`。
+
+- `--offline` 必须配合已存在、可信、非 `/` 的 `--root`。它**会写入该隔离目录**，不是 dry-run；不会操作或确认真实 systemd 状态。
+- 配置/状态/证书目录及关键路径必须由 root 控制、关键父级不可被其他身份写入；既有 `/etc/kat` 和证书目录须为 0700。输入凭据文件与私钥应为 root 所有的普通文件、组/其他位均为零（建议 0600）。菜单秘密输入不回显；非终端 install/modify 不输出节点密码/分享链接。**显式 `view`/`config` 仍导出完整凭据**，请保护终端和重定向文件。
+- 本地 `--binary` 使用私有副本校验摘要、探测版本，版本不可识别则拒绝。官方源及自定义内核镜像均默认核对同源 `.sha256` 中的资产文件名和内容摘要，不要求提供额外参数。同源侧车不是发布者签名；若不希望把程序和摘要都交给同一镜像信任，请另从可信渠道取得摘要，用 `--sha256` 同时核对，两者必须都匹配。
 
 ## 文件与格式
 
@@ -314,13 +312,13 @@ AnyTLS 保持 AnyTLS-Manager 的行为：默认用随机证书（配置里不写
 | `/var/lib/kat-manager/kernel.json` | 内核记录 `{version, sha256, source}` |
 | `/run/lock/kat-manager.lock` | 所有改动类操作共用的 flock 锁 |
 
-单元标记和 `kernel.json` 与 SS-Rust-Manager / AnyTLS-Manager 开发版 Kat 模式写出的兼容：那一版装的 `kat-ss`、`kat-anytls` 直接当作普通的已安装协议显示和管理，不需要重装。那一版留下的其他文件——`/var/lib/kat-manager/migrations/`、`/var/lib/kat-manager/backups/`、`kernel.json` 里的 `rollback` 字段、单元里的 `KatManagerAdopted` 标记、`/usr/local/bin/kat.rollback`——本脚本不读也不报错；前两个目录原样保留（可以手工删除），`kat.rollback` 在下次成功更新内核后删除。
+单元标记和 `kernel.json` 与 SS-Rust-Manager / AnyTLS-Manager 开发版 Kat 模式写出的兼容：那一版装的 `kat-ss`、`kat-anytls` 直接当作普通的已安装协议显示和管理，不需要重装。那一版留下的其他文件——`/var/lib/kat-manager/migrations/`、`/var/lib/kat-manager/backups/`、`kernel.json` 里的 `rollback` 字段、单元里的 `KatManagerAdopted` 标记、`/usr/local/bin/kat.rollback`——本脚本不读也不报错；前两个目录原样保留（可以手工删除），无可信摘要的 `kat.rollback` 保留供人工处理。
 
 环境变量（测试或自建镜像用）：`KAT_MANAGER_BASE_URL`（helper 下载地址）、`KAT_RELEASE_BASE_URL`（Release 下载前缀，下面是 `v<版本>/kat-<版本>-linux-amd64[.sha256]`）、`KAT_RELEASE_LATEST_URL`（返回 `{"tag_name":"vX.Y.Z"}` 的地址）、`KAT_PUBLIC_IP_URL`、`KAT_MANAGER_SETTLE_SECONDS`（启动后等待判定 active 的秒数）。
 
 ## 版本与验证
 
-本次精简改动已通过基础格式/配置/生命周期兼容回归 **42 项**、日志入口与手改 0.7 配置的定向回归 **7 项**，使用隔离目录、systemctl/journalctl 测试替身及真实内核的 check/version；没有操作运行中的服务或读取真实 journal。最终版本只追加版本/header、Bash/Python 语法、helper pin，以及独立 curl wrapper 和 hash 篡改拒绝短验证，不重复长测。
+旧版本记录（不是本开发树重新执行的结果）：精简改动当时通过基础格式/配置/生命周期兼容回归 **42 项**、日志入口与手改 0.7 配置的定向回归 **7 项**，使用隔离目录、systemctl/journalctl 测试替身及真实内核的 check/version；没有操作运行中的服务或读取真实 journal。最终版本只追加版本/header、Bash/Python 语法、helper pin，以及独立 curl wrapper 和 hash 篡改拒绝短验证，不重复长测。
 
 测试不等于真实 journal/实时流、ACME/DNS 签发续期、第三方客户端全矩阵或长期运行验证。下面的客户端格式说明沿用原版本验证结论，本次未重新跑完整互通矩阵。
 
@@ -341,5 +339,5 @@ bash scripts/pin-helpers.sh --check
 - Surge 行只做了字段级测试（Surge 不能在 Linux 运行）；Mihomo 行和 URI 用真实 mihomo 做了连通测试。mihomo 的分享链接解析器不对 `socks5://` 的用户信息做百分号解码，所以 SOCKS5 凭据含特殊字符时，请用 Mihomo 行，不要用 URI 导入 mihomo（URI 本身符合 RFC 3986）。
 - AnyTLS URI 现在把密码里的 `/` 编码为 `%2F`。旧脚本不编码，那种写法会被标准 URI 解析器截断。
 - AnyTLS 的 Mihomo 行比旧 AnyTLS-Manager 格式多了末尾的 `"udp":true`（其余字段和顺序不变）。旧格式没有这个字段，mihomo 会把节点当成只支持 TCP，UDP 改走客户端本机直连、不经节点（mihomo v1.19.32 实测：UDP 出口是客户端自己的 IP）。四个协议的 Mihomo 行现在都带 `"udp":true`，并在互通测试里验证了 UDP 确实经过 Kat 服务端。
-- helper 从 `main` 分支下载：main 上的 helper 改了但 `kat.sh` 没有重新 pin 时，curl|bash 会拒绝运行（安全失败）。发布时 helper 和 `kat.sh` 要放在同一个提交里。
+- raw main 管道属于可变的开发入口，不是发布附件；需要固定 helper 来源时，使用发布者生成的固定提交 wrapper。
 - SOCKS5 不加密，只适合在可信网络里用，或者作为其他加密隧道的上游。
