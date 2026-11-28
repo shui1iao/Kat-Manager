@@ -38,7 +38,7 @@ import urllib.request
 from kat_config import (ERROR, KINDS, MAX_BYTES, METHODS, PROTOCOL, SAFE_PATH, credential, domain_name, listen,
                         loads, markers, node, reject, text, tls_matches, unit, unit_sni, unit_tls_policy)
 
-VERSION = '0.1.3'
+VERSION = '0.1.4'
 BIN = '/usr/local/bin/kat'
 # No trustworthy digest exists for an arbitrary legacy rollback file; leave it alone.
 OLD_ROLLBACK = '/usr/local/bin/kat.rollback'
@@ -1812,31 +1812,43 @@ def check(binary, data, root, directory, source_tls=False, modern=False):
                 block[key] = rebase(block[key])
 
     tls = temporary_data['inbounds'][0].get('tls')
-    if tls:
-        pairs = ([tls] if tls.get('cert') or tls.get('key') else []) + tls.get('certificates', [])
+    if tls is not None:
+        if not isinstance(tls, dict):
+            reject()
+        certs = tls.get('certificates', [])
+        if not isinstance(certs, list):
+            reject()
+        pairs = ([tls] if 'cert' in tls or 'key' in tls else []) + certs
         for pair in pairs:
+            if not isinstance(pair, dict):
+                reject()
             if not source_tls:
                 fields(pair, ('cert', 'key'))
-            if not modern:
-                certificate(Path(pair['cert']), Path(pair['key']))
-            # The kernel validates modern file-following/multi-cert/ACME TLS.
-            # Keep private-key permissions and staging containment constraints.
-            key = Path(pair['key']).resolve()
-            for parent in reversed(key.parents):
-                trusted_dir(parent, sticky=True)
-            checked_file(key.stat(), private=True)
-            if key.parent.stat().st_uid != os.geteuid() or key.parent.stat().st_mode & 0o077:
+            if (not isinstance(pair.get('cert'), str) or not pair['cert']
+                    or not isinstance(pair.get('key'), str) or not pair['key']):
+                reject()
+            try:
+                if not modern:
+                    certificate(Path(pair['cert']), Path(pair['key']))
+                # The kernel validates modern file-following/multi-cert/ACME TLS.
+                # Keep private-key permissions and trusted parent containment
+                # on both the unreferenced link path and the resolved target
+                # (including 0755 roots like /etc/letsencrypt/{live,archive}/<domain>/).
+                raw_key = Path(pair['key']).absolute()
+                for parent in reversed(raw_key.parents):
+                    trusted_dir(parent, sticky=True)
+                trusted_dir(raw_key.parent, sticky=False)
+                key = raw_key.resolve()
+                for parent in reversed(key.parents):
+                    trusted_dir(parent, sticky=True)
+                trusted_dir(key.parent, sticky=False)
+                checked_file(key.stat(), private=True)
+            except (OSError, Fail):
                 reject()
         acme = tls.get('acme')
         if isinstance(acme, dict):
             fields(acme, ('storage', 'webroot', 'directory_ca'))
             fields(acme.get('dns'), ('api_token_file',))
-    for outbound in temporary_data.get('outbounds', []):
-        if isinstance(outbound, dict):
-            fields(outbound.get('tls'), ('ca',))
-    for source in [*temporary_data.get('rule_sets', []), *temporary_data.get('providers', []),
-                   *[temporary_data[k] for k in ('geoip', 'geosite', 'asn') if k in temporary_data]]:
-        fields(source, ('path',))
     for block, keys in (('log', ('file',)), ('stats', ('file',)), ('api', ('socket',))):
         fields(temporary_data.get(block), keys)
     # The stored data is never changed. check does not bind listeners, fetch

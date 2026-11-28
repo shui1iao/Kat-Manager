@@ -6,7 +6,6 @@ import base64
 import ipaddress
 import json
 import re
-import unicodedata
 from urllib.parse import urlsplit
 
 MAX_BYTES = 1 << 20  # the core's configuration size limit
@@ -15,17 +14,8 @@ METHODS = {'2022-blake3-aes-128-gcm': 16, '2022-blake3-aes-256-gcm': 32,
            '2022-blake3-chacha20-poly1305': 32, 'aes-128-gcm': 0,
            'aes-256-gcm': 0, 'chacha20-ietf-poly1305': 0}
 SAFE_PATH = re.compile(r'/[A-Za-z0-9_./+-]+\Z')
-# Shared routing core root blocks (frozen 2026-10-24 contract). The manager
-# recognizes, validates and preserves them; it never edits or renders them.
-CORE_BLOCKS = ('outbounds', 'groups', 'rule_sets', 'geoip')
-RESERVED = ('direct', 'reject')
-MAX_OUTBOUNDS, MAX_GROUPS, MAX_MEMBERS, MAX_CHAIN, MAX_RULE_SETS = 256, 64, 64, 4, 32
-OUTBOUND_TYPES = ('socks5', 'shadowsocks', 'trojan', 'anytls')
-OUTBOUND_OPTIONAL = ('via', 'udp', 'username', 'password', 'method', 'key', 'tls', 'idle_sessions', 'idle_timeout')
-GROUP_TYPES = ('select', 'url-test', 'fallback', 'smart')
-RULE_MATCHERS = ('domain', 'domain_suffix', 'domain_keyword', 'ip_cidr', 'src_ip_cidr',
-                 'geoip', 'dst_port', 'network', 'rule_set')
-MIB = 1024 * 1024
+REMOVED_TOP_KEYS = frozenset(('routing', 'outbounds', 'groups', 'providers', 'rule_sets', 'geoip', 'geosite', 'asn'))
+MAX_DNS_SERVERS = 16
 
 
 def reject():
@@ -140,16 +130,12 @@ def dns_endpoint(value, url=False):
         reject()
 
 
-def dns_config(value):
-    shape(value, (), ('server', 'cache_entries'))
-    server = value.get('server', 'system')
+def dns_server_entry(server, allow_system=False):
     if not isinstance(server, str) or not server or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in server):
         reject()
-    if 'cache_entries' in value:
-        cache = value['cache_entries']
-        if type(cache) is not int or not 0 <= cache <= 4096 or (server == 'system' and cache != 0):
-            reject()
     if server == 'system':
+        if not allow_system:
+            reject()
         return
     if any(c in server for c in ('?', '#', '\\')):
         reject()
@@ -157,7 +143,7 @@ def dns_config(value):
         dns_endpoint(server)
         return
     # Use URL parsing only for syntax; no resolution, HTTP or normalization.
-    scheme = server.split('://', 1)[0]
+    scheme = server.split('://', 1)[0].lower()
     if scheme not in ('udp', 'tcp', 'https'):
         reject()
     parsed = urlsplit(server)
@@ -171,6 +157,26 @@ def dns_config(value):
         reject()
 
 
+def dns_config(value):
+    strict(value, (), ('server', 'servers', 'cache_entries'))
+    if 'server' in value and 'servers' in value:
+        reject()
+    system_only = False
+    if 'server' in value:
+        dns_server_entry(value['server'], allow_system=True)
+        system_only = (value['server'] == 'system')
+    elif 'servers' in value:
+        servers = value['servers']
+        if not isinstance(servers, list) or not 1 <= len(servers) <= MAX_DNS_SERVERS:
+            reject()
+        for entry in servers:
+            dns_server_entry(entry, allow_system=False)
+    if 'cache_entries' in value:
+        cache = value['cache_entries']
+        if type(cache) is not int or not 0 <= cache <= 4096 or (system_only and cache != 0):
+            reject()
+
+
 def strict(value, required, optional=()):
     # New blocks follow the core's strict JSON: no unknown keys, no explicit null.
     shape(value, required, optional)
@@ -179,47 +185,8 @@ def strict(value, required, optional=()):
     return value
 
 
-# ---------------------------------------------------------------------------
-# Routing-core blocks.  Each check below mirrors the candidate core's static
-# validation (kernel/outbound_config.go, network_config.go, outbound/*
-# Validate, outbound/group.normalize, route.Options.Validate) so that every
-# configuration the core accepts is accepted here.  Only facts the core alone
-# can know (CA file existence/PEM content) are left to `kat check`.
-
-GO_SPACE = frozenset('\t\n\v\f\r \x85\xa0\u1680\u2028\u2029\u202f\u205f\u3000' + ''.join(map(chr, range(0x2000, 0x200b))))
 NS = 1000000000
 GO_UNITS = {'ns': 1, 'us': 1000, '\u00b5s': 1000, '\u03bcs': 1000, 'ms': 1000000, 's': NS, 'm': 60 * NS, 'h': 3600 * NS}
-HOST_CHARS = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' "!$&'()*+,;=:[]<>\"-_.~")
-USERINFO_CHARS = frozenset('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' "-._:~!$&'()*+,;=%@")
-HEX_DIGITS = frozenset('0123456789abcdefABCDEF')
-
-
-def choice(value, allowed):
-    if not isinstance(value, str) or value not in allowed:
-        reject()
-    return value
-
-
-def string(value, low=1, high=None):
-    # Non-empty JSON string (the core rejects "" members); bounds are UTF-8 bytes.
-    if not isinstance(value, str) or not low <= len(value.encode()) <= (high or len(value.encode())):
-        reject()
-    return value
-
-
-def go_name(value, equals=False):
-    """kernel validOutboundName (no '=') / route validName (equals=True)."""
-    string(value, 1, 64)
-    for c in value:
-        if unicodedata.category(c) == 'Cc' or c in GO_SPACE or (c == '=' and not equals):
-            reject()
-    return value
-
-
-def go_int(value, low, high):
-    if type(value) is not int or not low <= value <= high:
-        reject()
-    return value
 
 
 def go_bool(value):
@@ -285,463 +252,6 @@ def go_duration(value):
     return total
 
 
-def go_ip(value):
-    """netip.ParseAddr without zone."""
-    if '%' in value:
-        return False
-    try:
-        ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    return True
-
-
-def go_server(value):
-    """outbound validServer: zone-less IP literal or LDH(+underscore) name."""
-    string(value)
-    if go_ip(value):
-        return value
-    name = value[:-1] if value.endswith('.') else value
-    if not name or len(name) > 253:
-        reject()
-    for label in name.split('.'):
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,63}', label) or label[0] == '-' or label[-1] == '-':
-            reject()
-    return value
-
-
-def go_clean(path):
-    """path/filepath.Clean (Unix)."""
-    rooted, parts = path.startswith('/'), []
-    for part in path.split('/'):
-        if part == '..':
-            if parts and parts[-1] != '..':
-                parts.pop()
-            elif not rooted:
-                parts.append('..')
-        elif part not in ('', '.'):
-            parts.append(part)
-    joined = '/'.join(parts)
-    return '/' + joined if rooted else joined or '.'
-
-
-def file_path(value):
-    # The core only needs a non-empty NUL-free path; relative paths resolve
-    # against the core's working directory. Existence is checked by the core.
-    if '\x00' in string(value):
-        reject()
-    return value
-
-
-def valid_port(value):
-    return value == '' or (value[0] == ':' and all('0' <= c <= '9' for c in value[1:]))
-
-
-def unescape_ok(data, mode):
-    """net/url unescape validity on UTF-8 bytes (modes: host, zone, other)."""
-    i = 0
-    while i < len(data):
-        c = data[i]
-        if c == 0x25:
-            if i + 2 >= len(data) or chr(data[i + 1]) not in HEX_DIGITS or chr(data[i + 2]) not in HEX_DIGITS:
-                return False
-            if mode == 'host' and int(chr(data[i + 1]), 16) < 8 and data[i:i + 3] != b'%25':
-                return False
-            if mode == 'zone':
-                v = int(data[i + 1:i + 3], 16)
-                if data[i:i + 3] != b'%25' and v != 0x20 and (v >= 0x80 or chr(v) not in HOST_CHARS):
-                    return False
-            i += 3
-            continue
-        if mode in ('host', 'zone') and c < 0x80 and chr(c) not in HOST_CHARS:
-            return False
-        i += 1
-    return True
-
-
-def unescape(text):
-    data = re.sub(rb'%([0-9A-Fa-f]{2})', lambda m: bytes([int(m[1], 16)]), text.encode())
-    return data.decode('utf-8', 'surrogateescape')
-
-
-def go_host(host):
-    """net/url parseHost (Go 1.26 rules: bracketed hosts must be IPv6; one colon)."""
-    if host.startswith('['):
-        i = host.rfind(']')
-        if i < 0 or not valid_port(host[i + 1:]):
-            return None
-        zone = host[:i].find('%25')
-        if zone >= 0:
-            if not (unescape_ok(host[:zone].encode(), 'host') and unescape_ok(host[zone:i].encode(), 'zone')
-                    and unescape_ok(host[i:].encode(), 'host')):
-                return None
-            # address%zone: the zone must be non-empty, the address IPv6.
-            literal = unescape(host[1:zone]) + unescape(host[zone:i])
-            result = host[:zone] + unescape(host[zone:i]) + host[i:]
-        else:
-            if not unescape_ok(host.encode(), 'host'):
-                return None
-            literal = unescape(host[1:i])
-            result = unescape(host)
-            if '%' in literal:
-                return None
-        if ':' not in literal.partition('%')[0]:
-            return None
-        try:
-            ipaddress.IPv6Address(literal)
-        except ValueError:
-            return None
-        return result
-    i = host.rfind(':')
-    if i >= 0 and (':' in host[:i] or not valid_port(host[i:])):
-        return None
-    return unescape(host) if unescape_ok(host.encode(), 'host') else None
-
-
-def go_url(value):
-    """Subset of Go 1.26 net/url.Parse needed by the core's URL checks."""
-    if not isinstance(value, str):
-        return None
-    head, has_fragment, fragment = value.partition('#')
-    if any(ord(c) < 0x20 or ord(c) == 0x7f for c in head):
-        return None
-    scheme, rest = '', head
-    for i, c in enumerate(head):
-        if c.isascii() and c.isalpha():
-            continue
-        if c.isascii() and (c.isdigit() or c in '+-.'):
-            if i == 0:
-                break
-            continue
-        if c == ':':
-            if i == 0:
-                return None
-            scheme, rest = head[:i].lower(), head[i + 1:]
-        break
-    if rest.endswith('?') and rest.count('?') == 1:
-        rest = rest[:-1]
-    else:
-        rest = rest.partition('?')[0]
-    result = {'scheme': scheme, 'opaque': '', 'user': None, 'host': '', 'fragment': fragment, 'has_fragment': bool(has_fragment)}
-    if not rest.startswith('/'):
-        result['opaque'] = rest
-        return result if scheme else None
-    if rest.startswith('//') and (scheme or not rest.startswith('///')):
-        authority, slash, path = rest[2:].partition('/')
-        rest = slash + path
-        at = authority.rfind('@')
-        host = go_host(authority[at + 1:])
-        if host is None:
-            return None
-        if at >= 0:
-            user = authority[:at]
-            if any(c not in USERINFO_CHARS for c in user) or not unescape_ok(user.encode(), 'other'):
-                return None
-            result['user'] = user
-        result['host'] = host
-    if not unescape_ok(rest.encode(), 'other') or (has_fragment and not unescape_ok(fragment.encode(), 'other')):
-        return None
-    return result
-
-
-def split_host_port(host):
-    colon, port = host.rfind(':'), ''
-    if colon >= 0 and valid_port(host[colon:]):
-        host, port = host[:colon], host[colon + 1:]
-    if host.startswith('[') and host.endswith(']'):
-        host = host[1:-1]
-    return host, port
-
-
-def probe_url(value):
-    """group.normalize: absolute http(s) URL; userinfo/query/fragment allowed."""
-    string(value)
-    url = go_url(value)
-    if url is None or url['opaque'] or not url['host'] or url['scheme'] not in ('http', 'https'):
-        reject()
-    host, port = split_host_port(url['host'])
-    address, _, zone = host.partition('%')
-    if not host or (zone and ':' in address and go_ip(address)) or (port and not 0 < int(port) <= 65535):
-        reject()
-
-
-def source_url(value):
-    """route.validateURL: https only, no userinfo/fragment, at most 2048 bytes."""
-    string(value, 1, 2048)
-    url = go_url(value)
-    if (url is None or url['scheme'] != 'https' or url['opaque'] or url['user'] is not None or not url['host']
-            or url['fragment'] or '#' in value):
-        reject()
-    host, port = split_host_port(url['host'])
-    if not host or (port and not 0 < int(port) <= 65535):
-        reject()
-
-
-def ip_prefix(prefix):
-    """netip.ParsePrefix: zone-less address, decimal bits without leading zeros."""
-    if not isinstance(prefix, str) or '%' in prefix:
-        reject()
-    address, slash, bits = prefix.rpartition('/')
-    if not slash or not re.fullmatch(r'0|[1-9][0-9]*', bits) or not bits.isascii():
-        reject()
-    if int(bits) > ipaddress.ip_address(address).max_prefixlen:
-        reject()
-
-
-def routing_config(value):
-    """Validate routing locally; return (outbound refs, rule_set refs, needs geoip)."""
-    strict(value, (), ('rules', 'final'))
-    rules = value.get('rules', [])
-    if not isinstance(rules, list) or len(rules) > 1024:
-        reject()
-    refs, sets, geoip = [], [], False
-    if 'final' in value:
-        refs.append(go_name(value['final'], equals=True))
-    for rule in rules:
-        if not isinstance(rule, dict):
-            reject()
-        strict(rule, (), RULE_MATCHERS + ('action', 'outbound', 'no_resolve'))
-        selectors = [key for key in RULE_MATCHERS if key in rule]
-        actions = [key for key in ('action', 'outbound') if key in rule]
-        if len(selectors) != 1 or len(actions) != 1:
-            reject()
-        selector, action = selectors[0], actions[0]
-        match = string(rule[selector])
-        if 'no_resolve' in rule and go_bool(rule['no_resolve']) and selector not in ('ip_cidr', 'geoip', 'rule_set'):
-            reject()
-        if action == 'action':
-            choice(rule['action'], RESERVED)
-        else:
-            # direct/reject written as outbound are the built-ins (core rewrites them).
-            refs.append(go_name(rule['outbound'], equals=True))
-        if selector in ('ip_cidr', 'src_ip_cidr'):
-            ip_prefix(match)
-        elif selector in ('domain', 'domain_suffix'):
-            domain_name(match)
-        elif selector == 'domain_keyword':
-            if not re.fullmatch(r'[A-Za-z0-9._-]{1,253}', match):
-                reject()
-        elif selector == 'geoip':
-            private = match.isascii() and match.lower() == 'private'
-            if not private and not (len(match) == 2 and match.isascii() and match.isalpha()):
-                reject()
-            geoip = geoip or not private
-        elif selector == 'dst_port':
-            ports = re.fullmatch(r'([0-9]{1,5})(?:-([0-9]{1,5}))?', match)
-            if not ports or not 1 <= int(ports[1]) <= int(ports[2] or ports[1]) <= 65535:
-                reject()
-        elif selector == 'network':
-            if match.lower() not in ('tcp', 'udp'):
-                reject()
-        else:
-            sets.append(match)
-    return refs, sets, geoip
-
-
-def tls_options(value, trojan):
-    strict(value, (), ('server_name', 'ca', 'pin_sha256', 'insecure', 'alpn'))
-    if 'server_name' in value:
-        # trojan and anytls both validate server_name like server (validServer).
-        go_server(value['server_name'])
-    if 'ca' in value:
-        file_path(value['ca'])
-    if 'pin_sha256' in value:
-        if not re.fullmatch(r'[0-9a-f]{64}', string(value['pin_sha256']).lower().replace(':', '')):
-            reject()
-    if 'insecure' in value and go_bool(value['insecure']) and ('pin_sha256' in value or 'ca' in value):
-        reject()
-    if 'alpn' in value:
-        alpn = value['alpn']
-        if not isinstance(alpn, list) or len(alpn) > 8:
-            reject()
-        for protocol in alpn:
-            string(protocol, 1, 255)
-
-
-def outbound_config(value):
-    # Credentials are format-checked only; they never enter results or errors.
-    kind = choice(value.get('type') if isinstance(value, dict) else None, OUTBOUND_TYPES)
-    strict(value, ('name', 'type', 'server', 'port'), OUTBOUND_OPTIONAL)
-    go_name(value['name'])
-    go_server(value['server'])
-    go_int(value['port'], 1, 65535)
-    if 'via' in value:
-        go_name(value['via'])
-    if 'udp' in value:
-        go_bool(value['udp'])
-    for key in ('username', 'password', 'method', 'key'):
-        if key in value:
-            string(value[key])
-    # Keys that do not apply to a type are accepted only with their zero value.
-    sessions = go_int(value.get('idle_sessions', 0), -(1 << 63), (1 << 63) - 1)
-    idle = go_duration(value.get('idle_timeout', '0'))
-    if 'tls' in value and not isinstance(value['tls'], dict):
-        reject()
-    if kind != 'anytls' and (sessions or idle):
-        reject()
-    if kind == 'socks5':
-        if 'method' in value or 'key' in value or 'tls' in value or ('username' in value) != ('password' in value):
-            reject()
-        for key in ('username', 'password'):
-            if key in value:
-                string(value[key], 1, 255)
-        return
-    if kind == 'shadowsocks':
-        if 'username' in value or 'tls' in value:
-            reject()
-        size = METHODS[choice(value.get('method'), METHODS)]
-        if size:
-            key = value.get('key', '')
-            if 'password' in value or ':' in key:
-                reject()
-            key = key.replace('\r', '').replace('\n', '')
-            raw = base64.b64decode(key, validate=True)
-            if len(raw) != size or base64.b64encode(raw).decode() != key:
-                reject()
-        elif 'key' in value or not 1 <= len(string(value.get('password')).encode()) <= 4096:
-            reject()
-        return
-    if 'username' in value or 'method' in value or 'key' in value or 'tls' not in value:
-        reject()
-    string(value.get('password'), 1, 4096)
-    if kind == 'anytls' and (not 0 <= sessions <= 32 or not (idle == 0 or NS <= idle <= 600 * NS)):
-        reject()
-    tls_options(value['tls'], kind == 'trojan')
-
-
-def group_config(value):
-    kind = choice(value.get('type') if isinstance(value, dict) else None, GROUP_TYPES)
-    strict(value, ('name', 'type', 'members'), ('selected', 'probe', 'tolerance', 'priority'))
-    go_name(value['name'])
-    members = value['members']
-    if not isinstance(members, list) or not 1 <= len(members) <= MAX_MEMBERS:
-        reject()
-    for member in members:
-        if string(member) == value['name'] or (kind != 'select' and member == 'reject'):
-            reject()
-    if len(set(members)) != len(members):
-        reject()
-    if 'selected' in value and (kind != 'select' or value['selected'] not in members):
-        reject()
-    if 'tolerance' in value:
-        tolerance = go_duration(value['tolerance'])
-        if tolerance < 0 or (tolerance and kind != 'url-test'):
-            reject()
-    if 'priority' in value:
-        priority = value['priority']
-        if not isinstance(priority, dict) or (priority and kind != 'smart'):
-            reject()
-        for member, weight in priority.items():
-            if member not in members or type(weight) not in (int, float) or not 0 < weight <= 100:
-                reject()
-    if kind == 'select':
-        if 'probe' in value:
-            reject()
-        return
-    if 'probe' not in value:
-        reject()
-    probe = strict(value['probe'], ('url',), ('interval', 'timeout'))
-    probe_url(probe['url'])
-    interval = go_duration(probe.get('interval', '0'))
-    timeout = go_duration(probe.get('timeout', '0'))
-    if interval < 0 or 0 < interval < NS or not 0 <= timeout <= 60 * NS:
-        reject()
-
-
-def source_config(value, required, max_bytes, paths):
-    # Local file path, optionally refreshed from an explicit https URL.
-    strict(value, required + ('path',), ('url', 'interval', 'via', 'max_bytes'))
-    clean = go_clean(file_path(value['path']))
-    if clean in paths:
-        reject()
-    paths.add(clean)
-    size = go_int(value.get('max_bytes', 0), -(1 << 63), (1 << 63) - 1)
-    if size and not 1024 <= size <= max_bytes:
-        reject()
-    interval = go_duration(value.get('interval', '0'))
-    if 'url' not in value:
-        if interval or 'via' in value:
-            reject()
-        return
-    source_url(value['url'])
-    if interval and interval < 60 * NS:
-        reject()
-    if 'via' in value and go_name(value['via'], equals=True) == 'reject':
-        reject()
-
-
-def core_config(data, routing_refs):
-    """Validate outbounds/groups/rule_sets/geoip and the cross-block graph."""
-    lists = {}
-    for key, limit in (('outbounds', MAX_OUTBOUNDS), ('groups', MAX_GROUPS), ('rule_sets', MAX_RULE_SETS)):
-        lists[key] = data.get(key, [])
-        if not isinstance(lists[key], list) or len(lists[key]) > limit:
-            reject()
-    for value in lists['outbounds']:
-        outbound_config(value)
-    for value in lists['groups']:
-        group_config(value)
-    paths = set()
-    for value in lists['rule_sets']:
-        source_config(value, ('name', 'format'), 64 * MIB, paths)
-        go_name(value['name'], equals=True)
-        choice(value['format'], ('domain', 'ipcidr', 'classical'))
-    sources = list(lists['rule_sets'])
-    if 'geoip' in data:
-        if not isinstance(data['geoip'], dict):
-            reject()
-        source_config(data['geoip'], (), 256 * MIB, paths)
-        sources.append(data['geoip'])
-    outbounds = {value['name']: value for value in lists['outbounds']}
-    groups = {value['name']: value for value in lists['groups']}
-    if len(outbounds) + len(groups) != len(lists['outbounds']) + len(lists['groups']) or outbounds.keys() & groups.keys():
-        reject()
-    names = outbounds.keys() | groups.keys()
-    if names & set(RESERVED):
-        reject()
-    # Rule-set names are a separate namespace (they may even be 'direct').
-    set_names = [value['name'] for value in lists['rule_sets']]
-    if len(set(set_names)) != len(set_names):
-        reject()
-    refs, set_refs, needs_geoip = routing_refs
-    for ref in refs:
-        if ref not in names and ref not in RESERVED:
-            reject()
-    # Country rules need the geoip block; the built-in 'private' does not.
-    if not set(set_refs) <= set(set_names) or (needs_geoip and 'geoip' not in data):
-        reject()
-    for value in [*lists['outbounds'], *sources]:
-        # via 'direct' is the explicit default; 'reject' is never a dialer.
-        if 'via' in value and value['via'] not in names and value['via'] != 'direct':
-            reject()
-    for value in lists['groups']:
-        if not set(value['members']) <= names | set(RESERVED):
-            reject()
-    # Dependency graph (via + members) must be acyclic; chain depth counts
-    # proxy hops (groups add no hop, direct/reject are depth 0).
-    depths, active = {}, set()
-
-    def depth(item):
-        if item not in names:
-            return 0
-        if item in depths:
-            return depths[item]
-        if item in active:
-            reject()
-        active.add(item)
-        if item in outbounds:
-            result = 1 + depth(outbounds[item].get('via', 'direct'))
-        else:
-            result = max(depth(member) for member in groups[item]['members'])
-        active.discard(item)
-        if result > MAX_CHAIN:
-            reject()
-        depths[item] = result
-        return result
-    for item in sorted(names):
-        depth(item)
-
-
 # Kat core Limits (kernel/config.go) and AnyTLS identity budgets
 # (kernel/anytls.go normalize), identical static ranges in 0.6.0..0.6.2; only
 # the defaults differ. 0 means "core default". Version-dependent cross-field
@@ -750,12 +260,64 @@ MAX_DATAGRAM = 65507
 LIMIT_INTS = {'logical_streams': (1, 65536), 'connections': (1, 65536), 'handshakes': (1, 65536),
               'dials': (1, 65536), 'udp_associations': (1, 65536), 'pool_buffers': (1, 65536),
               'udp_queue': (1, 256), 'udp_targets': (1, 1024), 'buffer_size': (1024, 65536),
-              'udp_queue_bytes': (1, 256 * MAX_DATAGRAM)}
+              'udp_queue_bytes': (1, 256 * MAX_DATAGRAM), 'udp_fragment_bytes': (512, MAX_DATAGRAM)}
 LIMIT_TIMEOUTS = ('handshake_timeout', 'dial_timeout', 'drain_timeout', 'udp_idle')
 LIMIT_KEYS = tuple(LIMIT_INTS) + LIMIT_TIMEOUTS + ('tcp_idle', 'disable_fast_path')
 ANYTLS_INTS = {'max_sessions': (1, 65536), 'max_streams': (1, 65536), 'session_streams': (1, 64),
                'stream_bytes': (65542, 4 << 20), 'session_bytes': (1, 16 << 20)}
-ANYTLS_KEYS = tuple(ANYTLS_INTS) + ('slow_timeout',)
+ANYTLS_KEYS = tuple(ANYTLS_INTS) + ('slow_timeout', 'padding_scheme')
+
+
+def padding_int(raw):
+    if not raw or not raw.isascii() or not re.fullmatch(r'\+?[0-9]+', raw):
+        reject()
+    return int(raw)
+
+
+def padding_scheme(value):
+    """anytls.ValidatePaddingScheme(s, 4096); empty string selects DefaultPaddingScheme."""
+    if not isinstance(value, str) or len(value.encode('utf-8')) > 4096:
+        reject()
+    if value == '':
+        return
+    lines = value.split('\n')
+    if len(lines) > 66:
+        reject()
+    seen = {}
+    seen_idx = set()
+    stop = -1
+    for line in lines:
+        parts = line.split('=', 1)
+        if len(parts) != 2 or parts[0] in seen:
+            reject()
+        key, body = parts
+        seen[key] = True
+        if key == 'stop':
+            stop = padding_int(body)
+            if not 1 <= stop <= 64:
+                reject()
+            continue
+        index = padding_int(key)
+        if not 0 <= index < 64 or index in seen_idx:
+            reject()
+        seen_idx.add(index)
+        tokens = body.split(',')
+        if not 1 <= len(tokens) <= 32 or (index == 0 and len(tokens) != 1):
+            reject()
+        for token in tokens:
+            if token == 'c' and index != 0:
+                continue
+            bounds = token.split('-')
+            if len(bounds) != 2:
+                reject()
+            lo, hi = padding_int(bounds[0]), padding_int(bounds[1])
+            if not 0 <= lo <= hi <= 65535:
+                reject()
+    if stop < 0:
+        reject()
+    for index in seen_idx:
+        if index >= stop:
+            reject()
 
 
 def budget(value, low, high):
@@ -793,6 +355,8 @@ def anytls_options(options):
         value = go_duration(options['slow_timeout'])
         if value and not 1000000 <= value <= 60 * NS:
             reject()
+    if 'padding_scheme' in options:
+        padding_scheme(options['padding_scheme'])
 
 
 # Kat-Manager single-node kinds and their core inbound protocol names.
@@ -842,10 +406,15 @@ def single_user(users, required):
 
 def node(kind, data, modern=False):
     if modern:
-        # Own only the single inbound/identity in 0.7. The caller must run the
+        # Own only the single inbound/identity in 0.7+. The caller must run the
         # real kernel check for all advanced schema and cross references.
-        if not isinstance(data, dict) or not isinstance(data.get('inbounds'), list) or len(data['inbounds']) != 1:
+        if (not isinstance(data, dict) or any(k.lower() in REMOVED_TOP_KEYS for k in data if isinstance(k, str))
+                or not isinstance(data.get('inbounds'), list) or len(data['inbounds']) != 1):
             reject()
+        if 'dns' in data:
+            if data['dns'] is None:
+                reject()
+            dns_config(data['dns'])
         inbound = data['inbounds'][0]
         if not isinstance(inbound, dict):
             reject()
@@ -861,11 +430,11 @@ def node(kind, data, modern=False):
         return result
     if kind not in KINDS:
         reject()
-    shape(data, ('inbounds',), ('limits', 'dns', 'routing') + CORE_BLOCKS)
+    shape(data, ('inbounds',), ('limits', 'dns'))
     if 'dns' in data:
+        if data['dns'] is None:
+            reject()
         dns_config(data['dns'])
-    routing_refs = routing_config(data['routing']) if 'routing' in data else ([], [], False)
-    core_config(data, routing_refs)
     if not isinstance(data['inbounds'], list) or len(data['inbounds']) != 1:
         reject()
     # Every core Limits key is recognized with the core's static ranges (a

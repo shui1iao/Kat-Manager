@@ -1,5 +1,14 @@
 # 更新日志
 
+## v0.1.4 (2026-11-28)
+
+- **配置契约与 `Kat-Server v0.8.4` 严格对齐**：
+  - `kat_config.py`：移除手改配置已废弃的客户端顶层块白名单，避免放行服务端拒绝的旧字段；
+  - `dns_server_entry`：禁止在同一条 DNS 上游项中同时填写 `server` 与 `servers`，并将 URL scheme 统一按小写规范化匹配（兼容 `UDP://`、`HTTPS://` 等写法，与 Go `url.Parse` 对齐）；
+  - `padding_scheme`：拦截负包序号、负数或 `>65535` 范围、超界 `stop`、重复整数包序号（如 `"0"` 与 `"00"`/`"+0"`）及科学计数法 `c`。
+- **私钥软链父目录权限防 TOCTOU 加固**：`check()` 在 `resolve()` 前先核验未解引用私钥路径自身的父目录链属主与写权限，封堵经 `0777`/`01777` 目录软链掉包，同时完整兼容 `/etc/letsencrypt/live/<domain>/privkey.pem` 标准软链。
+- **测试与同步**：新增 `tests/test_kat_manager.py` 回归测试集，同步更新 `README.md` 与内置 helper SHA-256 钉扎。
+
 ## v0.1.3 (2026-11-23)
 
 - **Python 3.8 兼容修复**：`check()` 内路径归属校验改用 `Path.relative_to()` 替代 Python 3.9+ 专属 `is_relative_to()`，修复 Ubuntu 20.04 等旧系统下的 `AttributeError`。

@@ -1,6 +1,6 @@
 # Kat-Manager
 
-当前最新版本为 **v0.1.3**，详细发布变更见 [更新日志](CHANGELOG.md)。
+当前最新版本为 **v0.1.4**，详细发布变更见 [更新日志](CHANGELOG.md)。
 
 Kat 内核的统一管理脚本。一个入口 `kat.sh`，管理 Kat 支持的 4 种协议：
 
@@ -58,7 +58,7 @@ bash scripts/pin-helpers.sh --release-wrapper "$TAG" "$OUTPUT"
 
 ```
 ============================================
-          Kat 管理脚本 v0.1.3
+          Kat 管理脚本 v0.1.4
 ============================================
 仓库: github.com/shui1iao/Kat-Manager
 作者: shui1iao
