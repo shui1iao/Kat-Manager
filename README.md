@@ -1,56 +1,44 @@
 # Kat-Manager
 
-当前最新版本为 **v0.1.4**，详细发布变更见 [更新日志](CHANGELOG.md)。
+[![Release](https://img.shields.io/github/v/release/shui1iao/Kat-Manager?style=flat-square&color=2563eb)](https://github.com/shui1iao/Kat-Manager/releases/latest)
+[![Shell](https://img.shields.io/badge/Shell-Bash%20%2B%20Python3-4EAA25?style=flat-square&logo=gnu-bash&logoColor=white)](kat.sh)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20amd64%20(systemd)-1e293b?style=flat-square&logo=linux&logoColor=white)](https://github.com/shui1iao/Kat-Server)
 
-Kat 内核的统一管理脚本。一个入口 `kat.sh`，管理 Kat 支持的 4 种协议：
+**Kat Linux 服务端一键安装与管理脚本**——单个入口 `kat.sh` 统一管理 **Shadowsocks**、**AnyTLS**、**Trojan**、**SOCKS5** 四个协议节点与共享内核更新。
 
-| 协议 | 服务 | 配置 | 说明 |
-|---|---|---|---|
-| SS | `kat-ss.service` | `/etc/kat/ss.json` | SS2022（默认 `2022-blake3-aes-128-gcm`）与 SS2017，共 6 种加密方式 |
-| AnyTLS | `kat-anytls.service` | `/etc/kat/anytls.json` | 默认用内核的随机证书（客户端跳过校验） |
-| Trojan | `kat-trojan.service` | `/etc/kat/trojan.json` | 默认自签 EC 证书；可用自备证书 |
-| SOCKS5 | `kat-socks5.service` | `/etc/kat/socks5.json` | 必须有用户名/密码；**不加密，流量明文** |
+[快速开始](#快速开始) · [支持协议](#支持协议) · [命令一览](#命令一览) · [更新日志](CHANGELOG.md)
 
-每个协议一个节点（一个服务），所有服务共用一个内核 `/usr/local/bin/kat`。只支持 Linux amd64 + systemd，需要 root、`python3`、`curl`、`openssl`（Trojan 自签证书）。
+## 快速开始
 
-**安装就是安装**：只要端口不和别的程序或别的 Kat 协议冲突，就可以装，不影响其他协议，也不管机器上有没有 ss-rust、anytls 等其他服务。本脚本不读、不碰其他服务。
+支持 **Linux amd64 + systemd**，需要 `root`、`python3`、`curl`、`openssl`（Trojan 自签证书用）。
 
-## 入口与发布 wrapper
-
-在可信的完整 checkout 中运行 `bash kat.sh` 或 `bash kat.sh install ss`；本地模式直接使用同目录的两个 helper。需要 root 的操作不要在其他用户可写的 checkout 中执行。
-
-单文件入口分两种：
-
-- **开发入口**：仍可下载 `main/kat.sh` 单独运行，或执行 `curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh | bash`。它默认从可变的 `main` 取 helper，逐个匹配脚本内置 SHA256 后才执行。如果两次获取之间 main 发生变化且摘要不匹配，会直接拒绝；应重新获取相互匹配的脚本和 helper，而不是跳过校验。
-- **发布产物**：由下面的流程生成。它默认只从选定 tag 对应的完整 40 位提交 ID 取两个 helper，不会回退到 `main`。移动 main 不影响该产物的下载目标。
-
-两种远程模式均支持显式设置**传给 bash 的** `KAT_MANAGER_BASE_URL` 来指定受信镜像，都不会因此跳过内置摘要校验。脚本自身应从可信来源取得；摘要验证 helper，不替代对入口脚本来源的验证。
-
-维护者发布流程：由维护者决定版本，同步 `version.txt`、`kat.sh` 和 `kat_manager.py`，刷新 pin 并检查。待对应提交已有**维护者明确选择的**版本 tag 后，运行：
+### 运行最新正式发布版（推荐）
 
 ```bash
-# TAG 由维护者指定；OUTPUT 是尚不存在的文件，发布时作为 kat.sh
-bash scripts/pin-helpers.sh --release-wrapper "$TAG" "$OUTPUT"
+curl -fsSLO https://github.com/shui1iao/Kat-Manager/releases/latest/download/kat.sh
+bash kat.sh
 ```
 
-工具只核对该 tag 解引用后的提交内容与本树是否一致，生成用该提交取 helper 的独立文件；不会建 tag、提交或发布。发布者应另行验证 tag/提交的来源与远端可达性，签名或通过可信渠道分发 wrapper，再发布生成的产物。不要将当前修改指向已有的旧 tag。本文不提供指向尚不存在的新 Release 的一键安装链接。
+> 发布附件 `kat.sh` 已锁定对应版本的完整 40 位提交并内置组件 SHA-256 校验，不受开发分支变动影响。
 
-### 默认值
+## 支持协议
 
-- 端口：10000–65535 之间随机，避开其他 Kat 协议配置里的端口和本机已占用的 TCP/UDP 端口（读 `/proc/net/{tcp,tcp6,udp,udp6}`）。显式 `--port`（或 `modify --port`）冲突时拒绝，零改动。冲突规则：
-  - 任何进程已在监听这个 TCP 端口；
-  - SS 还要求这个 UDP 端口空闲（Kat 的 SS 在同一端口收 UDP；AnyTLS/Trojan 的 UDP 走 TCP 内，SOCKS5 的 UDP ASSOCIATE 用临时端口，所以这三个只看 TCP）；
-  - 另一个 Kat 协议的配置已经用了这个端口。
+| 协议 | systemd 服务 | 配置文件 | 说明 |
+| --- | --- | --- | --- |
+| **SS** | `kat-ss.service` | `/etc/kat/ss.json` | SS2022（默认 `2022-blake3-aes-128-gcm`）与 SS2017，共 6 种加密方式 |
+| **AnyTLS** | `kat-anytls.service` | `/etc/kat/anytls.json` | 默认使用内核随机自签证书，支持自定义 TLS |
+| **Trojan** | `kat-trojan.service` | `/etc/kat/trojan.json` | 默认自签 EC 证书，支持绑定自备证书 |
+| **SOCKS5** | `kat-socks5.service` | `/etc/kat/socks5.json` | 强制用户名/密码认证（明文传输，不加密） |
 
-  这是唯一的冲突判定。
-- 监听 `0.0.0.0`；`--listen IP:PORT` 可以指定（IPv6 写 `[::]:PORT`）。
-- 凭据：
-  - SS：`2022-blake3-aes-128-gcm` 加随机 16 字节 Base64 密钥（SS2017 用 20 位随机密码）。
-  - AnyTLS：16 位随机密码（规则与 AnyTLS-Manager 相同）。
-  - Trojan：20 位随机密码。
-  - SOCKS5：用户名 `kat` 加 7 位随机字符，密码 20 位随机。
-- 内核：GitHub Release 最新版，按 `.sha256` 校验。已经装了受管内核就直接复用，不再下载。
-- 节点地址：查询 `https://ipv4.icanhazip.com`；查不到就输出 `<服务器IP>` 占位。`--host` 只接受 IP 或 ASCII 域名并在动作前校验；IPv6 统一规范化。
+每个协议独立服务、共用 `/usr/local/bin/kat` 内核；安装前自动检测本机端口占用，不触碰机器上其他代理服务。
+
+## Kat 生态组件
+
+| 项目 | 角色 | 仓库 |
+| --- | --- | --- |
+| **Kat-Manager** | Linux 服务端一键管理脚本（本仓库） | [shui1iao/Kat-Manager](https://github.com/shui1iao/Kat-Manager) |
+| **Kat-Server** | Linux 服务端代理内核 | [shui1iao/Kat-Server](https://github.com/shui1iao/Kat-Server) |
+| **Kat-Client** | Windows 桌面客户端 | [shui1iao/Kat-Client](https://github.com/shui1iao/Kat-Client) |
 
 ## 首页
 
@@ -341,3 +329,46 @@ bash scripts/pin-helpers.sh --check
 - AnyTLS 的 Mihomo 行比旧 AnyTLS-Manager 格式多了末尾的 `"udp":true`（其余字段和顺序不变）。旧格式没有这个字段，mihomo 会把节点当成只支持 TCP，UDP 改走客户端本机直连、不经节点（mihomo v1.19.32 实测：UDP 出口是客户端自己的 IP）。四个协议的 Mihomo 行现在都带 `"udp":true`，并在互通测试里验证了 UDP 确实经过 Kat 服务端。
 - raw main 管道属于可变的开发入口，不是发布附件；需要固定 helper 来源时，使用发布者生成的固定提交 wrapper。
 - SOCKS5 不加密，只适合在可信网络里用，或者作为其他加密隧道的上游。
+
+
+<details>
+<summary>入口模式、默认值与维护者发布流程</summary>
+
+## 入口与发布 wrapper
+
+在可信的完整 checkout 中运行 `bash kat.sh` 或 `bash kat.sh install ss`；本地模式直接使用同目录的两个 helper。需要 root 的操作不要在其他用户可写的 checkout 中执行。
+
+单文件入口分两种：
+
+- **开发入口**：仍可下载 `main/kat.sh` 单独运行，或执行 `curl -fsSL https://raw.githubusercontent.com/shui1iao/Kat-Manager/main/kat.sh | bash`。它默认从可变的 `main` 取 helper，逐个匹配脚本内置 SHA256 后才执行。如果两次获取之间 main 发生变化且摘要不匹配，会直接拒绝；应重新获取相互匹配的脚本和 helper，而不是跳过校验。
+- **发布产物**：由下面的流程生成。它默认只从选定 tag 对应的完整 40 位提交 ID 取两个 helper，不会回退到 `main`。移动 main 不影响该产物的下载目标。
+
+两种远程模式均支持显式设置**传给 bash 的** `KAT_MANAGER_BASE_URL` 来指定受信镜像，都不会因此跳过内置摘要校验。脚本自身应从可信来源取得；摘要验证 helper，不替代对入口脚本来源的验证。
+
+维护者发布流程：由维护者决定版本，同步 `version.txt`、`kat.sh` 和 `kat_manager.py`，刷新 pin 并检查。待对应提交已有**维护者明确选择的**版本 tag 后，运行：
+
+```bash
+# TAG 由维护者指定；OUTPUT 是尚不存在的文件，发布时作为 kat.sh
+bash scripts/pin-helpers.sh --release-wrapper "$TAG" "$OUTPUT"
+```
+
+工具只核对该 tag 解引用后的提交内容与本树是否一致，生成用该提交取 helper 的独立文件；不会建 tag、提交或发布。发布者应另行验证 tag/提交的来源与远端可达性，签名或通过可信渠道分发 wrapper，再发布生成的产物。不要将当前修改指向已有的旧 tag。本文不提供指向尚不存在的新 Release 的一键安装链接。
+
+### 默认值
+
+- 端口：10000–65535 之间随机，避开其他 Kat 协议配置里的端口和本机已占用的 TCP/UDP 端口（读 `/proc/net/{tcp,tcp6,udp,udp6}`）。显式 `--port`（或 `modify --port`）冲突时拒绝，零改动。冲突规则：
+  - 任何进程已在监听这个 TCP 端口；
+  - SS 还要求这个 UDP 端口空闲（Kat 的 SS 在同一端口收 UDP；AnyTLS/Trojan 的 UDP 走 TCP 内，SOCKS5 的 UDP ASSOCIATE 用临时端口，所以这三个只看 TCP）；
+  - 另一个 Kat 协议的配置已经用了这个端口。
+
+  这是唯一的冲突判定。
+- 监听 `0.0.0.0`；`--listen IP:PORT` 可以指定（IPv6 写 `[::]:PORT`）。
+- 凭据：
+  - SS：`2022-blake3-aes-128-gcm` 加随机 16 字节 Base64 密钥（SS2017 用 20 位随机密码）。
+  - AnyTLS：16 位随机密码（规则与 AnyTLS-Manager 相同）。
+  - Trojan：20 位随机密码。
+  - SOCKS5：用户名 `kat` 加 7 位随机字符，密码 20 位随机。
+- 内核：GitHub Release 最新版，按 `.sha256` 校验。已经装了受管内核就直接复用，不再下载。
+- 节点地址：查询 `https://ipv4.icanhazip.com`；查不到就输出 `<服务器IP>` 占位。`--host` 只接受 IP 或 ASCII 域名并在动作前校验；IPv6 统一规范化。
+
+</details>
